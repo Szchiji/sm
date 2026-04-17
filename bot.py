@@ -166,11 +166,39 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"/addadmin [用户ID] - 添加其他管理员\n"
             f"/listgroups - 查看已绑定群组\n"
             f"/removegroup [群组ID] - 移除群组\n"
-            f"/bindgroup [群组ID] [群组名称] - 手动绑定群组（备用）"
+            f"/bindgroup [群组ID] [群组名称] - 手动绑定群组\n"
+            f"/test - 测试 Redis 连接"
         )
         await update.message.reply_text(text)
     elif update.message.text.startswith("/start join"):
         await handle_join_flow(update, context, user)
+
+async def test_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """测试命令，检查 Redis 和配置"""
+    user = update.effective_user
+    
+    if not is_admin(user.id):
+        await update.message.reply_text("你没有权限")
+        return
+    
+    # 测试 Redis
+    redis_status = "✅ 连接正常" if redis_client and redis_client.ping() else "❌ 连接失败"
+    
+    # 获取配置信息
+    groups = get_groups()
+    admin_ids = get_admin_ids_from_env()
+    
+    text = (
+        f"🧪 测试报告\n\n"
+        f"Redis 状态: {redis_status}\n"
+        f"环境变量管理员: {admin_ids}\n"
+        f"Redis 中的管理员: {list(redis_client.smembers(ADMINS_KEY)) if redis_client else 'N/A'}\n"
+        f"已绑定群组: {groups}\n"
+        f"当前用户ID: {user.id}\n"
+        f"是否为管理员: {is_admin(user.id)}"
+    )
+    
+    await update.message.reply_text(text)
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """处理加入按钮"""
@@ -206,7 +234,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def bot_added_to_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """机器人被添加到群组时触发"""
-    logger.info(f"Chat member update received: {update}")
+    logger.info(f"=== CHAT MEMBER UPDATE RECEIVED ===")
+    logger.info(f"Update type: {type(update)}")
+    logger.info(f"Update effective_chat: {update.effective_chat}")
+    logger.info(f"Update chat_member: {update.chat_member}")
     
     if not update.chat_member:
         logger.warning("No chat_member in update")
@@ -216,18 +247,20 @@ async def bot_added_to_group(update: Update, context: ContextTypes.DEFAULT_TYPE)
     new_member = update.chat_member.new_chat_member
     old_member = update.chat_member.old_chat_member
     
-    logger.info(f"Chat: {chat.title} ({chat.id}), New member: {new_member}, Old member: {old_member}")
+    logger.info(f"Chat: {chat.title if chat else 'None'} ({chat.id if chat else 'None'})")
+    logger.info(f"New member: {new_member}")
+    logger.info(f"Old member: {old_member}")
     
     if not new_member:
         logger.warning("No new_member in chat_member")
         return
     
     if new_member.user.id != context.bot.id:
-        logger.info("Update is not about bot")
+        logger.info(f"Update is not about bot (user id: {new_member.user.id}, bot id: {context.bot.id})")
         return
     
     added_by = update.effective_user
-    logger.info(f"Bot status changed to {new_member.status} by user {added_by.id}")
+    logger.info(f"Bot status changed from {old_member.status if old_member else 'None'} to {new_member.status} by user {added_by.id if added_by else 'None'}")
     
     if not is_admin(added_by.id):
         logger.warning(f"Non-admin {added_by.id} tried to add bot")
@@ -265,7 +298,10 @@ async def bot_added_to_group(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 async def bot_removed_from_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """机器人被移除时清理"""
+    logger.info(f"=== BOT REMOVED UPDATE ===")
+    
     if not update.chat_member:
+        logger.info("No chat_member in update")
         return
     
     chat = update.effective_chat
@@ -274,9 +310,11 @@ async def bot_removed_from_group(update: Update, context: ContextTypes.DEFAULT_T
     if not new_member or new_member.user.id != context.bot.id:
         return
     
+    logger.info(f"Bot status changed to {new_member.status}")
+    
     if new_member.status in ['left', 'kicked']:
         remove_group(chat.id)
-        logger.info(f"Bot left group: {chat.title}")
+        logger.info(f"Bot left group: {chat.title if chat else 'Unknown'}")
 
 # 备用：手动绑定群组命令
 async def bind_group_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -300,6 +338,8 @@ async def bind_group_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     group_id = context.args[0]
     group_title = " ".join(context.args[1:])
     
+    logger.info(f"Manual bind attempt: group_id={group_id}, title={group_title}, by={user.id}")
+    
     if save_group(group_id, group_title, user.id):
         await update.message.reply_text(
             f"✅ 已手动绑定群组：{group_title}\n"
@@ -307,7 +347,7 @@ async def bind_group_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"分享链接：https://t.me/{context.bot.username}?start=join"
         )
     else:
-        await update.message.reply_text("❌ 绑定失败")
+        await update.message.reply_text("❌ 绑定失败，请检查 Redis 连接")
 
 async def add_admin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """添加管理员命令"""
@@ -376,10 +416,19 @@ async def health_check(request):
 async def webhook_handler(request):
     """处理 Telegram Webhook 请求"""
     application = request.app['application']
-    data = await request.json()
-    update = Update.de_json(data, application.bot)
-    await application.process_update(update)
-    return web.Response(text="OK", status=200)
+    try:
+        data = await request.json()
+        update = Update.de_json(data, application.bot)
+        
+        # 记录所有收到的更新（用于调试）
+        if update.chat_member:
+            logger.info(f"Webhook received chat_member update: {update.chat_member}")
+        
+        await application.process_update(update)
+        return web.Response(text="OK", status=200)
+    except Exception as e:
+        logger.error(f"Webhook error: {e}")
+        return web.Response(text="Error", status=500)
 
 async def main():
     """主函数"""
@@ -392,6 +441,7 @@ async def main():
     
     # 添加处理器
     application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("test", test_cmd))
     application.add_handler(CallbackQueryHandler(button_handler, pattern="^join_"))
     application.add_handler(CommandHandler("addadmin", add_admin_cmd))
     application.add_handler(CommandHandler("listgroups", list_groups_cmd))
@@ -428,14 +478,20 @@ async def main():
     
     if use_webhook and webhook_url:
         await application.initialize()
-        await application.bot.set_webhook(url=webhook_url)
+        # 重要：设置 webhook 时指定接收所有更新类型，包括 chat_member
+        await application.bot.set_webhook(
+            url=webhook_url,
+            allowed_updates=["message", "callback_query", "chat_member", "my_chat_member"]
+        )
         await application.start()
         logger.info(f"Bot started with webhook: {webhook_url}")
     else:
         logger.warning("No webhook URL configured, falling back to polling")
         await application.initialize()
         await application.start()
-        await application.updater.start_polling()
+        await application.updater.start_polling(
+            allowed_updates=["message", "callback_query", "chat_member", "my_chat_member"]
+        )
         logger.info("Bot started with polling")
     
     # 保持运行
