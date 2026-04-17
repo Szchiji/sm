@@ -188,14 +188,21 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def bot_added_to_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """机器人被添加到群组时触发"""
+    # 安全检查：确保是 chat_member 更新
+    if not update.chat_member:
+        return
+    
     chat = update.effective_chat
     new_member = update.chat_member.new_chat_member
+    old_member = update.chat_member.old_chat_member
     
-    if new_member.user.id != context.bot.id:
+    # 检查是否是机器人自己被添加
+    if not new_member or new_member.user.id != context.bot.id:
         return
     
     added_by = update.effective_user
     
+    # 检查添加者是否为管理员
     if not is_admin(added_by.id):
         logger.warning(f"Non-admin {added_by.id} tried to add bot to {chat.title}")
         try:
@@ -204,10 +211,11 @@ async def bot_added_to_group(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 text="只有机器人管理员才能使用此功能"
             )
             await context.bot.leave_chat(chat.id)
-        except:
-            pass
+        except Exception as e:
+            logger.error(f"Failed to leave chat: {e}")
         return
     
+    # 检查是否为管理员身份
     if new_member.status == 'administrator':
         if save_group(chat.id, chat.title, added_by.id):
             logger.info(f"Group saved: {chat.title} ({chat.id})")
@@ -219,23 +227,30 @@ async def bot_added_to_group(update: Update, context: ContextTypes.DEFAULT_TYPE)
                          f"群组ID: {chat.id}\n"
                          f"分享链接：https://t.me/{context.bot.username}?start=join"
                 )
-            except:
-                pass
+            except Exception as e:
+                logger.error(f"Failed to notify admin: {e}")
     elif new_member.status == 'member':
         try:
             await context.bot.send_message(
                 chat_id=chat.id,
                 text=f"@{added_by.username} 请将机器人设为管理员，否则无法使用加群功能"
             )
-        except:
-            pass
+        except Exception as e:
+            logger.error(f"Failed to send message: {e}")
 
 async def bot_removed_from_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """机器人被移除时清理"""
+    # 安全检查
+    if not update.chat_member:
+        return
+    
     chat = update.effective_chat
     new_member = update.chat_member.new_chat_member
     
-    if new_member.user.id == context.bot.id and new_member.status in ['left', 'kicked']:
+    if not new_member or new_member.user.id != context.bot.id:
+        return
+    
+    if new_member.status in ['left', 'kicked']:
         remove_group(chat.id)
         logger.info(f"Bot left group: {chat.title}")
 
@@ -345,25 +360,21 @@ async def main():
     webhook_url = None
     
     if WEBHOOK_URL:
-        # 手动设置的 Webhook URL（优先级最高）
         webhook_url = WEBHOOK_URL
         use_webhook = True
         logger.info(f"Using manually set webhook URL: {webhook_url}")
     elif RAILWAY_DOMAIN:
-        # 自动检测的 Railway 域名
         webhook_url = f"https://{RAILWAY_DOMAIN}/webhook"
         use_webhook = True
         logger.info(f"Using Railway domain: {RAILWAY_DOMAIN}")
     
     if use_webhook and webhook_url:
-        # Webhook 模式
         await application.initialize()
         await application.bot.set_webhook(url=webhook_url)
         await application.start()
         logger.info(f"Bot started with webhook: {webhook_url}")
     else:
-        # Polling 模式（仅本地开发）
-        logger.warning("No webhook URL configured, falling back to polling (local dev only)")
+        logger.warning("No webhook URL configured, falling back to polling")
         await application.initialize()
         await application.start()
         await application.updater.start_polling()
