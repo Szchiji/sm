@@ -44,6 +44,7 @@ GROUP_OWNER_PREFIX = "tg_bot:group_owner:"  # 反向查找：group_id -> admin_i
 ADMINS_KEY = "tg_bot:admins"
 INVITE_LOG_KEY = "tg_bot:invite_log"
 USER_INVITE_PREFIX = "tg_bot:user_invite:"
+PENDING_REQUEST_PREFIX = "tg_bot:pending:"  # 待审批申请：key = pending:{user_id}_{group_id}
 
 def groups_key(admin_id):
     """返回指定管理员的群组 Redis key"""
@@ -133,6 +134,53 @@ def remove_group(group_id):
     except Exception as e:
         logger.error(f"Failed to remove group: {e}")
         return False
+
+def set_group_approval(group_id, admin_id, required: bool):
+    """设置群组是否需要管理员审批才能加入"""
+    if not redis_client:
+        return False
+    try:
+        groups = get_groups(admin_id)
+        gid = str(group_id)
+        if gid not in groups:
+            return False
+        groups[gid]['approval_required'] = required
+        redis_client.set(groups_key(admin_id), json.dumps(groups))
+        return True
+    except Exception as e:
+        logger.error(f"Failed to set approval for group {group_id}: {e}")
+        return False
+
+def save_pending_request(user_id, group_id, user_info, group_title, admin_id):
+    """保存待审批的加群申请（TTL 与冷却时间相同）"""
+    if not redis_client:
+        return False
+    key = f"{PENDING_REQUEST_PREFIX}{user_id}_{group_id}"
+    data = {
+        "user_id": user_id,
+        "username": user_info.get("username"),
+        "first_name": user_info.get("first_name", ""),
+        "group_id": str(group_id),
+        "group_title": group_title,
+        "admin_id": admin_id,
+        "created_at": datetime.now().isoformat()
+    }
+    redis_client.setex(key, INVITE_COOLDOWN_HOURS * 3600, json.dumps(data))
+    return True
+
+def get_pending_request(user_id, group_id):
+    """获取待审批申请，不存在返回 None"""
+    if not redis_client:
+        return None
+    key = f"{PENDING_REQUEST_PREFIX}{user_id}_{group_id}"
+    data = redis_client.get(key)
+    return json.loads(data) if data else None
+
+def delete_pending_request(user_id, group_id):
+    """删除待审批申请"""
+    if not redis_client:
+        return
+    redis_client.delete(f"{PENDING_REQUEST_PREFIX}{user_id}_{group_id}")
 
 def migrate_global_groups():
     """将旧全局群组数据迁移到按管理员隔离的 key"""
@@ -356,8 +404,45 @@ async def cleanup_expired_data(application: Application):
 
 # ============ 业务逻辑 ============
 
+async def request_join_approval(update, context, user, group_id, group_title, admin_id):
+    """提交加群申请，通知管理员审批；返回 True 表示申请已提交"""
+    existing = get_pending_request(user.id, group_id)
+    if existing:
+        await update.message.reply_text(
+            f"⏳ 你已提交过「{group_title}」的申请，请等待管理员审核"
+        )
+        return True
+
+    user_info = {"username": user.username, "first_name": user.first_name or ""}
+    save_pending_request(user.id, group_id, user_info, group_title, admin_id)
+
+    mention = f"@{user.username}" if user.username else user.full_name
+    keyboard = [[
+        InlineKeyboardButton("✅ 同意", callback_data=f"approve_{user.id}_{group_id}"),
+        InlineKeyboardButton("❌ 拒绝", callback_data=f"reject_{user.id}_{group_id}")
+    ]]
+    try:
+        await context.bot.send_message(
+            chat_id=admin_id,
+            text=f"📋 加群申请\n\n用户：{mention}（ID: {user.id}）\n申请加入：{group_title}",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+    except Exception as e:
+        logger.error(f"Failed to notify admin {admin_id}: {e}")
+        delete_pending_request(user.id, group_id)
+        await update.message.reply_text(f"❌ {group_title} 申请提交失败，请联系管理员")
+        return False
+
+    await update.message.reply_text(f"📤 已提交加入「{group_title}」的申请，请等待管理员审核")
+    return True
+
 async def send_single_invite(update, context, user, group_id, group_title, admin_id=None):
-    """发送单个邀请"""
+    """发送单个邀请；若群组开启审批则转为申请流程"""
+    if admin_id:
+        groups = get_groups(admin_id)
+        if groups.get(str(group_id), {}).get('approval_required', False):
+            return await request_join_approval(update, context, user, group_id, group_title, admin_id)
+
     can_get, ttl = can_user_get_invite(user.id, group_id)
     if not can_get:
         time_left = format_time_left(ttl)
@@ -408,10 +493,12 @@ async def handle_join_flow(update: Update, context: ContextTypes.DEFAULT_TYPE, u
     keyboard = []
     for gid, info in groups.items():
         can_get, ttl = can_user_get_invite(user.id, gid)
-        if can_get:
-            status = ""
-        else:
+        if not can_get:
             status = " (冷却中)"
+        elif info.get('approval_required', False):
+            status = " (需审批)"
+        else:
+            status = ""
         
         keyboard.append([InlineKeyboardButton(
             f"{info['title']}{status}", 
@@ -470,38 +557,70 @@ async def handle_join_all(update: Update, context: ContextTypes.DEFAULT_TYPE, us
         return
     
     # 多个可用，直接生成所有邀请链接，无需确认
-    processing_msg = await update.message.reply_text("⏳ 正在生成邀请链接，请稍候...")
+    processing_msg = await update.message.reply_text("⏳ 正在处理，请稍候...")
     
     keyboard_buttons = []
     failed_groups = []
+    approval_submitted = []
     success_count = 0
     
     for gid, title in available_groups:
-        try:
-            expire_time = int((datetime.now() + timedelta(minutes=INVITE_EXPIRE_MINUTES)).timestamp())
-            invite_link = await context.bot.create_chat_invite_link(
-                chat_id=int(gid),
-                member_limit=1,
-                expire_date=expire_time
-            )
-            log_invite(user.id, gid, invite_link.invite_link, title, admin_id)
-            record_user_invite(user.id, gid)
-            keyboard_buttons.append([InlineKeyboardButton(f"👉 加入 {title}", url=invite_link.invite_link)])
-            success_count += 1
-        except Exception as e:
-            logger.error(f"Failed to create invite for {gid}: {e}")
-            failed_groups.append(title)
+        group_info = groups[gid]
+        if group_info.get('approval_required', False):
+            # 该群组需要审批
+            existing = get_pending_request(user.id, gid)
+            if existing:
+                approval_submitted.append(f"⏳ {title} (审核中)")
+            else:
+                user_info = {"username": user.username, "first_name": user.first_name or ""}
+                save_pending_request(user.id, gid, user_info, title, admin_id)
+                mention = f"@{user.username}" if user.username else user.full_name
+                notify_keyboard = [[
+                    InlineKeyboardButton("✅ 同意", callback_data=f"approve_{user.id}_{gid}"),
+                    InlineKeyboardButton("❌ 拒绝", callback_data=f"reject_{user.id}_{gid}")
+                ]]
+                try:
+                    await context.bot.send_message(
+                        chat_id=admin_id,
+                        text=f"📋 加群申请\n\n用户：{mention}（ID: {user.id}）\n申请加入：{title}",
+                        reply_markup=InlineKeyboardMarkup(notify_keyboard)
+                    )
+                    approval_submitted.append(f"📤 {title} (等待审核)")
+                except Exception as e:
+                    logger.error(f"Failed to notify admin for {gid}: {e}")
+                    delete_pending_request(user.id, gid)
+                    failed_groups.append(title)
+        else:
+            try:
+                expire_time = int((datetime.now() + timedelta(minutes=INVITE_EXPIRE_MINUTES)).timestamp())
+                invite_link = await context.bot.create_chat_invite_link(
+                    chat_id=int(gid),
+                    member_limit=1,
+                    expire_date=expire_time
+                )
+                log_invite(user.id, gid, invite_link.invite_link, title, admin_id)
+                record_user_invite(user.id, gid)
+                keyboard_buttons.append([InlineKeyboardButton(f"👉 加入 {title}", url=invite_link.invite_link)])
+                success_count += 1
+            except Exception as e:
+                logger.error(f"Failed to create invite for {gid}: {e}")
+                failed_groups.append(title)
     
-    text = f"✅ 已生成 {success_count} 个邀请链接\n"
+    text = ""
+    if success_count:
+        text += f"✅ 已生成 {success_count} 个邀请链接\n"
+    if approval_submitted:
+        text += "\n".join(approval_submitted) + "\n"
     if cooling_groups:
         text += f"⏳ {len(cooling_groups)} 个群组冷却中\n"
     if failed_groups:
-        text += f"❌ {len(failed_groups)} 个群组生成失败\n"
-    text += f"\n⏰ 链接将在 {INVITE_EXPIRE_MINUTES} 分钟后过期\n"
-    text += "🔒 每个链接仅限使用一次"
+        text += f"❌ {len(failed_groups)} 个群组处理失败\n"
+    if success_count:
+        text += f"\n⏰ 链接将在 {INVITE_EXPIRE_MINUTES} 分钟后过期\n"
+        text += "🔒 每个链接仅限使用一次"
     
     await processing_msg.edit_text(
-        text,
+        text or "处理完成",
         reply_markup=InlineKeyboardMarkup(keyboard_buttons) if keyboard_buttons else None
     )
 
@@ -553,6 +672,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"/listgroups\n"
             f"/removegroup [群组ID]\n"
             f"/bindgroup [群组ID] [群组名称]\n"
+            f"/setapproval [群组ID] - 切换审批模式（开/关）\n"
             f"/stats - 查看统计\n"
             f"/cleanup - 清理过期数据\n"
             f"/revoke - 立即撤销失效链接\n"
@@ -607,6 +727,32 @@ async def select_group_callback(update: Update, context: ContextTypes.DEFAULT_TY
     
     group_title = groups[group_id]['title']
     
+    # 检查是否需要审批
+    if groups[group_id].get('approval_required', False):
+        existing = get_pending_request(user_id, group_id)
+        if existing:
+            await query.edit_message_text(f"⏳ 你已提交过「{group_title}」的申请，请等待管理员审核")
+            return
+        user_info = {"username": query.from_user.username, "first_name": query.from_user.first_name or ""}
+        save_pending_request(user_id, group_id, user_info, group_title, admin_id)
+        mention = f"@{query.from_user.username}" if query.from_user.username else query.from_user.full_name
+        notify_keyboard = [[
+            InlineKeyboardButton("✅ 同意", callback_data=f"approve_{user_id}_{group_id}"),
+            InlineKeyboardButton("❌ 拒绝", callback_data=f"reject_{user_id}_{group_id}")
+        ]]
+        try:
+            await context.bot.send_message(
+                chat_id=admin_id,
+                text=f"📋 加群申请\n\n用户：{mention}（ID: {user_id}）\n申请加入：{group_title}",
+                reply_markup=InlineKeyboardMarkup(notify_keyboard)
+            )
+            await query.edit_message_text(f"📤 已提交加入「{group_title}」的申请，请等待管理员审核")
+        except Exception as e:
+            logger.error(f"Failed to notify admin {admin_id}: {e}")
+            delete_pending_request(user_id, group_id)
+            await query.edit_message_text(f"❌ {group_title} 申请提交失败，请联系管理员")
+        return
+    
     # 直接生成邀请链接，无需二次确认
     try:
         expire_time = int((datetime.now() + timedelta(minutes=INVITE_EXPIRE_MINUTES)).timestamp())
@@ -654,13 +800,39 @@ async def join_all_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     success_count = 0
     
     # 编辑消息显示处理中
-    await query.edit_message_text("⏳ 正在生成邀请链接，请稍候...")
+    await query.edit_message_text("⏳ 正在处理，请稍候...")
     
     for gid, info in groups.items():
         # 检查冷却
         can_get, ttl = can_user_get_invite(user_id, gid)
         if not can_get:
-            results.append(f"❌ {info['title']} - 冷却中 ({format_time_left(ttl)})")
+            results.append(f"⏳ {info['title']} - 冷却中 ({format_time_left(ttl)})")
+            continue
+        
+        # 检查是否需要审批
+        if info.get('approval_required', False):
+            existing = get_pending_request(user_id, gid)
+            if existing:
+                results.append(f"⏳ {info['title']} - 审核中")
+                continue
+            user_info = {"username": query.from_user.username, "first_name": query.from_user.first_name or ""}
+            save_pending_request(user_id, gid, user_info, info['title'], admin_id)
+            mention = f"@{query.from_user.username}" if query.from_user.username else query.from_user.full_name
+            notify_keyboard = [[
+                InlineKeyboardButton("✅ 同意", callback_data=f"approve_{user_id}_{gid}"),
+                InlineKeyboardButton("❌ 拒绝", callback_data=f"reject_{user_id}_{gid}")
+            ]]
+            try:
+                await context.bot.send_message(
+                    chat_id=admin_id,
+                    text=f"📋 加群申请\n\n用户：{mention}（ID: {user_id}）\n申请加入：{info['title']}",
+                    reply_markup=InlineKeyboardMarkup(notify_keyboard)
+                )
+                results.append(f"📤 {info['title']} - 等待审核")
+            except Exception as e:
+                logger.error(f"Failed to notify admin for {gid}: {e}")
+                delete_pending_request(user_id, gid)
+                results.append(f"❌ {info['title']} - 申请提交失败")
             continue
         
         try:
@@ -684,10 +856,11 @@ async def join_all_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             results.append(f"❌ {info['title']} - 生成失败")
     
     # 发送结果
-    text = f"📋 邀请链接生成结果（成功 {success_count}/{len(groups)}）：\n\n"
+    text = f"📋 处理结果（邀请 {success_count}/{len(groups)}）：\n\n"
     text += "\n".join(results)
-    text += f"\n\n⏰ 所有链接 {INVITE_EXPIRE_MINUTES} 分钟后过期\n"
-    text += "🔒 每个链接仅限使用一次"
+    if success_count:
+        text += f"\n\n⏰ 邀请链接 {INVITE_EXPIRE_MINUTES} 分钟后过期\n"
+        text += "🔒 每个链接仅限使用一次"
     
     await query.edit_message_text(
         text,
@@ -751,6 +924,121 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.error(f"Failed to create invite link: {e}")
         await query.edit_message_text("生成邀请链接失败，请联系管理员")
+
+async def approve_request_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """管理员同意加群申请"""
+    query = update.callback_query
+    await query.answer()
+
+    # format: approve_{user_id}_{group_id}
+    parts = query.data.split("_", 2)
+    if len(parts) < 3:
+        await query.edit_message_text("数据格式错误")
+        return
+
+    user_id = int(parts[1])
+    group_id = parts[2]
+    admin_id = query.from_user.id
+
+    req = get_pending_request(user_id, group_id)
+    if not req:
+        await query.edit_message_text("❌ 申请已过期或不存在")
+        return
+
+    group_title = req['group_title']
+
+    try:
+        expire_time = int((datetime.now() + timedelta(minutes=INVITE_EXPIRE_MINUTES)).timestamp())
+        invite_link = await context.bot.create_chat_invite_link(
+            chat_id=int(group_id),
+            member_limit=1,
+            expire_date=expire_time
+        )
+        log_invite(user_id, group_id, invite_link.invite_link, group_title, admin_id)
+        record_user_invite(user_id, group_id)
+        delete_pending_request(user_id, group_id)
+
+        try:
+            keyboard = [[InlineKeyboardButton(f"👉 加入 {group_title}", url=invite_link.invite_link)]]
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=f"✅ 你的加入「{group_title}」申请已通过！\n"
+                     f"⏰ 链接 {INVITE_EXPIRE_MINUTES} 分钟后过期\n"
+                     f"🔒 仅限一次使用",
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+        except Exception as e:
+            logger.error(f"Failed to notify user {user_id}: {e}")
+
+        await query.edit_message_text(f"✅ 已同意用户 {user_id} 加入「{group_title}」")
+        logger.info(f"Admin {admin_id} approved join request: user {user_id} -> group {group_id}")
+
+    except Exception as e:
+        logger.error(f"Failed to create invite for approved request: {e}")
+        await query.edit_message_text(f"❌ 生成邀请链接失败: {e}")
+
+async def reject_request_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """管理员拒绝加群申请"""
+    query = update.callback_query
+    await query.answer()
+
+    # format: reject_{user_id}_{group_id}
+    parts = query.data.split("_", 2)
+    if len(parts) < 3:
+        await query.edit_message_text("数据格式错误")
+        return
+
+    user_id = int(parts[1])
+    group_id = parts[2]
+
+    req = get_pending_request(user_id, group_id)
+    group_title = req['group_title'] if req else "未知群组"
+    delete_pending_request(user_id, group_id)
+
+    try:
+        await context.bot.send_message(
+            chat_id=user_id,
+            text=f"❌ 你的加入「{group_title}」申请未通过"
+        )
+    except Exception as e:
+        logger.error(f"Failed to notify user {user_id}: {e}")
+
+    await query.edit_message_text(f"❌ 已拒绝用户 {user_id} 加入「{group_title}」")
+    logger.info(f"Admin {query.from_user.id} rejected join request: user {user_id} -> group {group_id}")
+
+async def set_approval_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """切换群组的审批模式（开/关）"""
+    user = update.effective_user
+
+    if not is_admin(user.id):
+        await update.message.reply_text("你没有权限")
+        return
+
+    if not context.args:
+        await update.message.reply_text(
+            "用法: /setapproval [群组ID]\n"
+            "每次执行会切换该群组的审批模式（开/关）\n"
+            "开启后，用户需等待管理员同意才能获得邀请链接"
+        )
+        return
+
+    group_id = context.args[0]
+    groups = get_groups(user.id)
+
+    if str(group_id) not in groups:
+        await update.message.reply_text("未找到该群组，或你无权修改它")
+        return
+
+    current = groups[str(group_id)].get('approval_required', False)
+    new_value = not current
+
+    if set_group_approval(group_id, user.id, new_value):
+        status = "开启 🔒" if new_value else "关闭 🔓"
+        await update.message.reply_text(
+            f"✅ 群组「{groups[str(group_id)]['title']}」审批模式已{status}"
+        )
+    else:
+        await update.message.reply_text("❌ 设置失败")
 
 async def cleanup_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """手动清理命令"""
@@ -900,7 +1188,20 @@ async def bot_added_to_group(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if not new_member or new_member.user.id != context.bot.id:
         return
     
+    old_status = old_member.status if old_member else None
+    new_status = new_member.status
+    
+    logger.info(f"Bot status changed from {old_status} to {new_status}")
+    
+    # Bot is leaving or was kicked — handled by bot_removed_from_group
+    if new_status in ('left', 'kicked'):
+        return
+    
     added_by = update.effective_user
+    
+    if not added_by or added_by.id == context.bot.id:
+        logger.warning("Could not determine who added the bot")
+        return
     
     if not is_admin(added_by.id):
         logger.warning(f"Non-admin {added_by.id} tried to add bot")
@@ -913,11 +1214,6 @@ async def bot_added_to_group(update: Update, context: ContextTypes.DEFAULT_TYPE)
         except Exception as e:
             logger.error(f"Failed to leave chat: {e}")
         return
-    
-    old_status = old_member.status if old_member else None
-    new_status = new_member.status
-    
-    logger.info(f"Bot status changed from {old_status} to {new_status}")
     
     if new_status == 'administrator' and old_status != 'administrator':
         if save_group(chat.id, chat.title, added_by.id):
@@ -935,10 +1231,11 @@ async def bot_added_to_group(update: Update, context: ContextTypes.DEFAULT_TYPE)
             except Exception as e:
                 logger.error(f"Failed to notify admin: {e}")
     elif new_status == 'member':
+        mention = f"@{added_by.username}" if added_by.username else added_by.full_name
         try:
             await context.bot.send_message(
                 chat_id=chat.id,
-                text=f"@{added_by.username} 请将机器人设为管理员，否则无法使用加群功能"
+                text=f"{mention} 请将机器人设为管理员，否则无法使用加群功能"
             )
         except Exception as e:
             logger.error(f"Failed to send message: {e}")
@@ -1022,7 +1319,8 @@ async def list_groups_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     text = "已绑定群组列表：\n\n"
     for gid, info in groups.items():
-        text += f"• {info['title']}\n  ID: `{gid}`\n\n"
+        approval = "🔒 需审批" if info.get('approval_required', False) else "🔓 直接加入"
+        text += f"• {info['title']}\n  ID: `{gid}`\n  审批模式: {approval}\n\n"
     
     await update.message.reply_text(text, parse_mode="Markdown")
 
@@ -1086,8 +1384,11 @@ async def main():
     application.add_handler(CommandHandler("listgroups", list_groups_cmd))
     application.add_handler(CommandHandler("removegroup", remove_group_cmd))
     application.add_handler(CommandHandler("bindgroup", bind_group_cmd))
+    application.add_handler(CommandHandler("setapproval", set_approval_cmd))
     
     # 回调处理器
+    application.add_handler(CallbackQueryHandler(approve_request_callback, pattern="^approve_"))
+    application.add_handler(CallbackQueryHandler(reject_request_callback, pattern="^reject_"))
     application.add_handler(CallbackQueryHandler(select_group_callback, pattern="^select_"))
     application.add_handler(CallbackQueryHandler(join_all_callback, pattern="^joinall_"))
     application.add_handler(CallbackQueryHandler(button_handler, pattern="^join_"))
