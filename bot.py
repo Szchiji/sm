@@ -220,12 +220,10 @@ async def revoke_expired_invites(application: Application):
                 continue
             
             try:
-                # 使用 bot 实例直接调用 API
-                async with application.bot:
-                    await application.bot.revoke_chat_invite_link(
-                        chat_id=int(group_id),
-                        invite_link=invite_link
-                    )
+                await application.bot.revoke_chat_invite_link(
+                    chat_id=int(group_id),
+                    invite_link=invite_link
+                )
                 
                 # 标记为已撤销
                 entry['revoked'] = True
