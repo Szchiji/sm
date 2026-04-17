@@ -2,6 +2,8 @@ import os
 import logging
 import redis
 import json
+import asyncio
+from aiohttp import web
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler, 
@@ -20,6 +22,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_USER_IDS = os.getenv("ADMIN_USER_IDS", "")
 WELCOME_TEXT = os.getenv("WELCOME_TEXT", "👋 欢迎！点击下方按钮加入群组：")
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+PORT = int(os.environ.get("PORT", 8080))
 
 # Redis Key 前缀
 GROUPS_KEY = "tg_bot:groups"
@@ -220,7 +223,7 @@ async def bot_added_to_group(update: Update, context: ContextTypes.DEFAULT_TYPE)
 async def bot_removed_from_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """机器人被移除时清理"""
     chat = update.effective_chat
-    new_member = update.chat_member.new_chat_member
+    new_member = update.chat_member.new_member
     
     if new_member.user.id == context.bot.id and new_member.status in ['left', 'kicked']:
         remove_group(chat.id)
@@ -283,13 +286,33 @@ async def remove_group_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("移除失败")
 
-def main():
+# HTTP 健康检查
+async def health_check(request):
+    """健康检查端点"""
+    return web.Response(text="OK", status=200)
+
+async def run_http_server():
+    """运行 HTTP 服务器供健康检查"""
+    app = web.Application()
+    app.router.add_get("/", health_check)
+    app.router.add_get("/health", health_check)
+    
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", PORT)
+    await site.start()
+    logger.info(f"HTTP server started on port {PORT}")
+
+async def main():
+    """主函数"""
     if redis_client:
         init_admin_from_env()
         logger.info(f"Loaded admins: {get_admin_ids_from_env()}")
     
+    # 创建应用
     application = Application.builder().token(BOT_TOKEN).build()
     
+    # 添加处理器
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CallbackQueryHandler(button_handler, pattern="^join_"))
     application.add_handler(CommandHandler("addadmin", add_admin_cmd))
@@ -297,17 +320,33 @@ def main():
     application.add_handler(CommandHandler("removegroup", remove_group_cmd))
     application.add_handler(ChatMemberHandler(bot_added_to_group, ChatMemberHandler.MY_CHAT_MEMBER))
     
-    PORT = int(os.environ.get("PORT", 8080))
-    RAILWAY_STATIC_URL = os.environ.get("RAILWAY_STATIC_URL")
+    # 启动 HTTP 服务器（用于健康检查）
+    await run_http_server()
     
+    # 启动机器人（使用 webhook 模式）
+    RAILWAY_STATIC_URL = os.environ.get("RAILWAY_STATIC_URL")
     if RAILWAY_STATIC_URL:
-        application.run_webhook(
-            listen="0.0.0.0",
-            port=PORT,
-            webhook_url=f"{RAILWAY_STATIC_URL}/webhook"
+        await application.initialize()
+        await application.bot.set_webhook(
+            url=f"{RAILWAY_STATIC_URL}/webhook",
+            allowed_updates=Update.ALL_TYPES
         )
+        await application.start()
+        logger.info("Bot started with webhook")
+        
+        # 保持运行
+        while True:
+            await asyncio.sleep(3600)
     else:
-        application.run_polling()
+        # 本地开发使用 polling
+        await application.initialize()
+        await application.start()
+        await application.updater.start_polling()
+        logger.info("Bot started with polling")
+        
+        # 保持运行
+        while True:
+            await asyncio.sleep(3600)
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
