@@ -900,7 +900,20 @@ async def bot_added_to_group(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if not new_member or new_member.user.id != context.bot.id:
         return
     
+    old_status = old_member.status if old_member else None
+    new_status = new_member.status
+    
+    logger.info(f"Bot status changed from {old_status} to {new_status}")
+    
+    # Bot is leaving or was kicked — handled by bot_removed_from_group
+    if new_status in ('left', 'kicked'):
+        return
+    
     added_by = update.effective_user
+    
+    if not added_by or added_by.id == context.bot.id:
+        logger.warning("Could not determine who added the bot")
+        return
     
     if not is_admin(added_by.id):
         logger.warning(f"Non-admin {added_by.id} tried to add bot")
@@ -913,11 +926,6 @@ async def bot_added_to_group(update: Update, context: ContextTypes.DEFAULT_TYPE)
         except Exception as e:
             logger.error(f"Failed to leave chat: {e}")
         return
-    
-    old_status = old_member.status if old_member else None
-    new_status = new_member.status
-    
-    logger.info(f"Bot status changed from {old_status} to {new_status}")
     
     if new_status == 'administrator' and old_status != 'administrator':
         if save_group(chat.id, chat.title, added_by.id):
@@ -935,10 +943,11 @@ async def bot_added_to_group(update: Update, context: ContextTypes.DEFAULT_TYPE)
             except Exception as e:
                 logger.error(f"Failed to notify admin: {e}")
     elif new_status == 'member':
+        mention = f"@{added_by.username}" if added_by.username else added_by.full_name
         try:
             await context.bot.send_message(
                 chat_id=chat.id,
-                text=f"@{added_by.username} 请将机器人设为管理员，否则无法使用加群功能"
+                text=f"{mention} 请将机器人设为管理员，否则无法使用加群功能"
             )
         except Exception as e:
             logger.error(f"Failed to send message: {e}")
