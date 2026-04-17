@@ -76,34 +76,50 @@ def get_groups():
     """从 Redis 获取所有群组"""
     if not redis_client:
         return {}
-    data = redis_client.get(GROUPS_KEY)
-    return json.loads(data) if data else {}
+    try:
+        data = redis_client.get(GROUPS_KEY)
+        return json.loads(data) if data else {}
+    except Exception as e:
+        logger.error(f"Failed to get groups from Redis: {e}")
+        return {}
 
 def save_group(group_id, title, added_by):
     """保存群组到 Redis"""
     if not redis_client:
+        logger.error("Redis not available")
         return False
-    groups = get_groups()
-    groups[str(group_id)] = {
-        "title": title,
-        "added_by": added_by,
-        "invite_link": None
-    }
-    redis_client.set(GROUPS_KEY, json.dumps(groups))
-    return True
+    try:
+        groups = get_groups()
+        groups[str(group_id)] = {
+            "title": title,
+            "added_by": added_by,
+            "invite_link": None
+        }
+        redis_client.set(GROUPS_KEY, json.dumps(groups))
+        logger.info(f"Group saved to Redis: {title} ({group_id})")
+        return True
+    except Exception as e:
+        logger.error(f"Failed to save group: {e}")
+        return False
 
 def remove_group(group_id):
     """从 Redis 删除群组"""
     if not redis_client:
         return False
-    groups = get_groups()
-    groups.pop(str(group_id), None)
-    redis_client.set(GROUPS_KEY, json.dumps(groups))
-    return True
+    try:
+        groups = get_groups()
+        groups.pop(str(group_id), None)
+        redis_client.set(GROUPS_KEY, json.dumps(groups))
+        return True
+    except Exception as e:
+        logger.error(f"Failed to remove group: {e}")
+        return False
 
 async def handle_join_flow(update: Update, context: ContextTypes.DEFAULT_TYPE, user):
     """处理用户加入流程"""
     groups = get_groups()
+    logger.info(f"Current groups: {groups}")
+    
     if not groups:
         await update.message.reply_text("机器人尚未配置群组，请联系管理员")
         return
@@ -124,6 +140,7 @@ async def handle_join_flow(update: Update, context: ContextTypes.DEFAULT_TYPE, u
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """用户点击链接开始"""
     user = update.effective_user
+    logger.info(f"Start command from user: {user.id}, text: {update.message.text}")
     
     if not is_admin(user.id):
         if update.message.text and update.message.text.startswith("/start join"):
@@ -148,7 +165,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"管理员命令：\n"
             f"/addadmin [用户ID] - 添加其他管理员\n"
             f"/listgroups - 查看已绑定群组\n"
-            f"/removegroup [群组ID] - 移除群组"
+            f"/removegroup [群组ID] - 移除群组\n"
+            f"/bindgroup [群组ID] [群组名称] - 手动绑定群组（备用）"
         )
         await update.message.reply_text(text)
     elif update.message.text.startswith("/start join"):
@@ -188,23 +206,31 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def bot_added_to_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """机器人被添加到群组时触发"""
-    # 安全检查：确保是 chat_member 更新
+    logger.info(f"Chat member update received: {update}")
+    
     if not update.chat_member:
+        logger.warning("No chat_member in update")
         return
     
     chat = update.effective_chat
     new_member = update.chat_member.new_chat_member
     old_member = update.chat_member.old_chat_member
     
-    # 检查是否是机器人自己被添加
-    if not new_member or new_member.user.id != context.bot.id:
+    logger.info(f"Chat: {chat.title} ({chat.id}), New member: {new_member}, Old member: {old_member}")
+    
+    if not new_member:
+        logger.warning("No new_member in chat_member")
+        return
+    
+    if new_member.user.id != context.bot.id:
+        logger.info("Update is not about bot")
         return
     
     added_by = update.effective_user
+    logger.info(f"Bot status changed to {new_member.status} by user {added_by.id}")
     
-    # 检查添加者是否为管理员
     if not is_admin(added_by.id):
-        logger.warning(f"Non-admin {added_by.id} tried to add bot to {chat.title}")
+        logger.warning(f"Non-admin {added_by.id} tried to add bot")
         try:
             await context.bot.send_message(
                 chat_id=chat.id,
@@ -215,18 +241,17 @@ async def bot_added_to_group(update: Update, context: ContextTypes.DEFAULT_TYPE)
             logger.error(f"Failed to leave chat: {e}")
         return
     
-    # 检查是否为管理员身份
     if new_member.status == 'administrator':
         if save_group(chat.id, chat.title, added_by.id):
-            logger.info(f"Group saved: {chat.title} ({chat.id})")
-            
             try:
                 await context.bot.send_message(
                     chat_id=added_by.id,
-                    text=f"机器人已成功绑定到群组 {chat.title}\n"
-                         f"群组ID: {chat.id}\n"
-                         f"分享链接：https://t.me/{context.bot.username}?start=join"
+                    text=f"✅ 机器人已成功绑定到群组「{chat.title}」\n"
+                         f"群组ID: `{chat.id}`\n"
+                         f"分享链接：https://t.me/{context.bot.username}?start=join",
+                    parse_mode="Markdown"
                 )
+                logger.info(f"Notification sent to admin {added_by.id}")
             except Exception as e:
                 logger.error(f"Failed to notify admin: {e}")
     elif new_member.status == 'member':
@@ -240,7 +265,6 @@ async def bot_added_to_group(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 async def bot_removed_from_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """机器人被移除时清理"""
-    # 安全检查
     if not update.chat_member:
         return
     
@@ -253,6 +277,37 @@ async def bot_removed_from_group(update: Update, context: ContextTypes.DEFAULT_T
     if new_member.status in ['left', 'kicked']:
         remove_group(chat.id)
         logger.info(f"Bot left group: {chat.title}")
+
+# 备用：手动绑定群组命令
+async def bind_group_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """手动绑定群组（当自动绑定失效时使用）"""
+    user = update.effective_user
+    
+    if not is_admin(user.id):
+        await update.message.reply_text("你没有权限")
+        return
+    
+    if len(context.args) < 2:
+        await update.message.reply_text(
+            "用法: /bindgroup [群组ID] [群组名称]\n"
+            "示例: /bindgroup -1001234567890 我的私密群\n\n"
+            "获取群组ID方法：\n"
+            "1. 将 @userinfobot 拉入群组\n"
+            "2. 它会回复群组ID"
+        )
+        return
+    
+    group_id = context.args[0]
+    group_title = " ".join(context.args[1:])
+    
+    if save_group(group_id, group_title, user.id):
+        await update.message.reply_text(
+            f"✅ 已手动绑定群组：{group_title}\n"
+            f"群组ID: {group_id}\n"
+            f"分享链接：https://t.me/{context.bot.username}?start=join"
+        )
+    else:
+        await update.message.reply_text("❌ 绑定失败")
 
 async def add_admin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """添加管理员命令"""
@@ -283,15 +338,17 @@ async def list_groups_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     groups = get_groups()
+    logger.info(f"Listing groups: {groups}")
+    
     if not groups:
         await update.message.reply_text("暂无绑定的群组")
         return
     
     text = "已绑定群组列表：\n\n"
     for gid, info in groups.items():
-        text += f"• {info['title']}\n  ID: {gid}\n\n"
+        text += f"• {info['title']}\n  ID: `{gid}`\n\n"
     
-    await update.message.reply_text(text)
+    await update.message.reply_text(text, parse_mode="Markdown")
 
 async def remove_group_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """手动移除群组"""
@@ -339,6 +396,7 @@ async def main():
     application.add_handler(CommandHandler("addadmin", add_admin_cmd))
     application.add_handler(CommandHandler("listgroups", list_groups_cmd))
     application.add_handler(CommandHandler("removegroup", remove_group_cmd))
+    application.add_handler(CommandHandler("bindgroup", bind_group_cmd))
     application.add_handler(ChatMemberHandler(bot_added_to_group, ChatMemberHandler.MY_CHAT_MEMBER))
     
     # 创建 HTTP 应用
