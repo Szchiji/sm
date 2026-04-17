@@ -67,8 +67,8 @@ def get_admin_ids_from_env():
 def is_admin(user_id):
     """检查用户是否为管理员"""
     env_admins = get_admin_ids_from_env()
-    if env_admins:
-        return user_id in env_admins
+    if user_id in env_admins:
+        return True
     
     if not redis_client:
         return False
