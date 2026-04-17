@@ -255,6 +255,13 @@ def format_time_left(seconds):
         mins = (seconds % 3600) // 60
         return f"{hours}小时{mins}分钟" if mins > 0 else f"{hours}小时"
 
+def format_user_info(user_id, first_name="", last_name="", username=None):
+    """格式化用户信息（用于管理员审批通知），包含可点击的私聊链接"""
+    full_name = f"{first_name} {last_name}".strip() or str(user_id)
+    name_link = f'<a href="tg://user?id={user_id}">{full_name}</a>'
+    username_part = f"@{username}" if username else "无用户名"
+    return f"昵称：{name_link}\n用户名：{username_part}\nID：<code>{user_id}</code>"
+
 # ============ 自动清理功能 ============
 
 async def cleanup_expired_invites():
@@ -416,7 +423,7 @@ async def request_join_approval(update, context, user, group_id, group_title, ad
     user_info = {"username": user.username, "first_name": user.first_name or ""}
     save_pending_request(user.id, group_id, user_info, group_title, admin_id)
 
-    mention = f"@{user.username}" if user.username else user.full_name
+    user_detail = format_user_info(user.id, user.first_name or "", user.last_name or "", user.username)
     keyboard = [[
         InlineKeyboardButton("✅ 同意", callback_data=f"approve_{user.id}_{group_id}"),
         InlineKeyboardButton("❌ 拒绝", callback_data=f"reject_{user.id}_{group_id}")
@@ -424,8 +431,9 @@ async def request_join_approval(update, context, user, group_id, group_title, ad
     try:
         await context.bot.send_message(
             chat_id=admin_id,
-            text=f"📋 加群申请\n\n用户：{mention}（ID: {user.id}）\n申请加入：{group_title}",
-            reply_markup=InlineKeyboardMarkup(keyboard)
+            text=f"📋 加群申请\n\n{user_detail}\n\n申请加入：{group_title}",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode="HTML"
         )
     except Exception as e:
         logger.error(f"Failed to notify admin {admin_id}: {e}")
@@ -574,7 +582,7 @@ async def handle_join_all(update: Update, context: ContextTypes.DEFAULT_TYPE, us
             else:
                 user_info = {"username": user.username, "first_name": user.first_name or ""}
                 save_pending_request(user.id, gid, user_info, title, admin_id)
-                mention = f"@{user.username}" if user.username else user.full_name
+                user_detail = format_user_info(user.id, user.first_name or "", user.last_name or "", user.username)
                 notify_keyboard = [[
                     InlineKeyboardButton("✅ 同意", callback_data=f"approve_{user.id}_{gid}"),
                     InlineKeyboardButton("❌ 拒绝", callback_data=f"reject_{user.id}_{gid}")
@@ -582,8 +590,9 @@ async def handle_join_all(update: Update, context: ContextTypes.DEFAULT_TYPE, us
                 try:
                     await context.bot.send_message(
                         chat_id=admin_id,
-                        text=f"📋 加群申请\n\n用户：{mention}（ID: {user.id}）\n申请加入：{title}",
-                        reply_markup=InlineKeyboardMarkup(notify_keyboard)
+                        text=f"📋 加群申请\n\n{user_detail}\n\n申请加入：{title}",
+                        reply_markup=InlineKeyboardMarkup(notify_keyboard),
+                        parse_mode="HTML"
                     )
                     approval_submitted.append(f"📤 {title} (等待审核)")
                 except Exception as e:
@@ -735,7 +744,7 @@ async def select_group_callback(update: Update, context: ContextTypes.DEFAULT_TY
             return
         user_info = {"username": query.from_user.username, "first_name": query.from_user.first_name or ""}
         save_pending_request(user_id, group_id, user_info, group_title, admin_id)
-        mention = f"@{query.from_user.username}" if query.from_user.username else query.from_user.full_name
+        user_detail = format_user_info(user_id, query.from_user.first_name or "", query.from_user.last_name or "", query.from_user.username)
         notify_keyboard = [[
             InlineKeyboardButton("✅ 同意", callback_data=f"approve_{user_id}_{group_id}"),
             InlineKeyboardButton("❌ 拒绝", callback_data=f"reject_{user_id}_{group_id}")
@@ -743,8 +752,9 @@ async def select_group_callback(update: Update, context: ContextTypes.DEFAULT_TY
         try:
             await context.bot.send_message(
                 chat_id=admin_id,
-                text=f"📋 加群申请\n\n用户：{mention}（ID: {user_id}）\n申请加入：{group_title}",
-                reply_markup=InlineKeyboardMarkup(notify_keyboard)
+                text=f"📋 加群申请\n\n{user_detail}\n\n申请加入：{group_title}",
+                reply_markup=InlineKeyboardMarkup(notify_keyboard),
+                parse_mode="HTML"
             )
             await query.edit_message_text(f"📤 已提交加入「{group_title}」的申请，请等待管理员审核")
         except Exception as e:
@@ -817,7 +827,7 @@ async def join_all_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 continue
             user_info = {"username": query.from_user.username, "first_name": query.from_user.first_name or ""}
             save_pending_request(user_id, gid, user_info, info['title'], admin_id)
-            mention = f"@{query.from_user.username}" if query.from_user.username else query.from_user.full_name
+            user_detail = format_user_info(user_id, query.from_user.first_name or "", query.from_user.last_name or "", query.from_user.username)
             notify_keyboard = [[
                 InlineKeyboardButton("✅ 同意", callback_data=f"approve_{user_id}_{gid}"),
                 InlineKeyboardButton("❌ 拒绝", callback_data=f"reject_{user_id}_{gid}")
@@ -825,8 +835,9 @@ async def join_all_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             try:
                 await context.bot.send_message(
                     chat_id=admin_id,
-                    text=f"📋 加群申请\n\n用户：{mention}（ID: {user_id}）\n申请加入：{info['title']}",
-                    reply_markup=InlineKeyboardMarkup(notify_keyboard)
+                    text=f"📋 加群申请\n\n{user_detail}\n\n申请加入：{info['title']}",
+                    reply_markup=InlineKeyboardMarkup(notify_keyboard),
+                    parse_mode="HTML"
                 )
                 results.append(f"📤 {info['title']} - 等待审核")
             except Exception as e:
@@ -948,11 +959,9 @@ async def approve_request_callback(update: Update, context: ContextTypes.DEFAULT
     group_title = req['group_title']
 
     try:
-        expire_time = int((datetime.now() + timedelta(minutes=INVITE_EXPIRE_MINUTES)).timestamp())
         invite_link = await context.bot.create_chat_invite_link(
             chat_id=int(group_id),
-            member_limit=1,
-            expire_date=expire_time
+            member_limit=1
         )
         log_invite(user_id, group_id, invite_link.invite_link, group_title, admin_id)
         record_user_invite(user_id, group_id)
@@ -963,7 +972,6 @@ async def approve_request_callback(update: Update, context: ContextTypes.DEFAULT
             await context.bot.send_message(
                 chat_id=user_id,
                 text=f"✅ 你的加入「{group_title}」申请已通过！\n"
-                     f"⏰ 链接 {INVITE_EXPIRE_MINUTES} 分钟后过期\n"
                      f"🔒 仅限一次使用",
                 reply_markup=InlineKeyboardMarkup(keyboard)
             )
