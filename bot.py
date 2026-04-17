@@ -181,15 +181,12 @@ async def test_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("你没有权限")
         return
     
-    # 测试 Redis
-    redis_status = "✅ 连接正常" if redis_client and redis_client.ping() else "❌ 连接失败"
-    
-    # 获取配置信息
+    redis_status = "连接正常" if redis_client and redis_client.ping() else "连接失败"
     groups = get_groups()
     admin_ids = get_admin_ids_from_env()
     
     text = (
-        f"🧪 测试报告\n\n"
+        f"测试报告\n\n"
         f"Redis 状态: {redis_status}\n"
         f"环境变量管理员: {admin_ids}\n"
         f"Redis 中的管理员: {list(redis_client.smembers(ADMINS_KEY)) if redis_client else 'N/A'}\n"
@@ -238,14 +235,18 @@ async def bot_added_to_group(update: Update, context: ContextTypes.DEFAULT_TYPE)
     logger.info(f"Update type: {type(update)}")
     logger.info(f"Update effective_chat: {update.effective_chat}")
     logger.info(f"Update chat_member: {update.chat_member}")
+    logger.info(f"Update my_chat_member: {update.my_chat_member}")
     
-    if not update.chat_member:
-        logger.warning("No chat_member in update")
+    # 关键修复：同时检查 chat_member 和 my_chat_member
+    chat_member_update = update.chat_member or update.my_chat_member
+    
+    if not chat_member_update:
+        logger.warning("No chat_member or my_chat_member in update")
         return
     
     chat = update.effective_chat
-    new_member = update.chat_member.new_chat_member
-    old_member = update.chat_member.old_chat_member
+    new_member = chat_member_update.new_chat_member
+    old_member = chat_member_update.old_chat_member
     
     logger.info(f"Chat: {chat.title if chat else 'None'} ({chat.id if chat else 'None'})")
     logger.info(f"New member: {new_member}")
@@ -300,12 +301,15 @@ async def bot_removed_from_group(update: Update, context: ContextTypes.DEFAULT_T
     """机器人被移除时清理"""
     logger.info(f"=== BOT REMOVED UPDATE ===")
     
-    if not update.chat_member:
-        logger.info("No chat_member in update")
+    # 关键修复：同时检查 chat_member 和 my_chat_member
+    chat_member_update = update.chat_member or update.my_chat_member
+    
+    if not chat_member_update:
+        logger.info("No chat_member or my_chat_member in update")
         return
     
     chat = update.effective_chat
-    new_member = update.chat_member.new_chat_member
+    new_member = chat_member_update.new_chat_member
     
     if not new_member or new_member.user.id != context.bot.id:
         return
@@ -316,7 +320,6 @@ async def bot_removed_from_group(update: Update, context: ContextTypes.DEFAULT_T
         remove_group(chat.id)
         logger.info(f"Bot left group: {chat.title if chat else 'Unknown'}")
 
-# 备用：手动绑定群组命令
 async def bind_group_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """手动绑定群组（当自动绑定失效时使用）"""
     user = update.effective_user
@@ -420,9 +423,8 @@ async def webhook_handler(request):
         data = await request.json()
         update = Update.de_json(data, application.bot)
         
-        # 记录所有收到的更新（用于调试）
-        if update.chat_member:
-            logger.info(f"Webhook received chat_member update: {update.chat_member}")
+        if update.chat_member or update.my_chat_member:
+            logger.info(f"Webhook received member update: chat_member={update.chat_member is not None}, my_chat_member={update.my_chat_member is not None}")
         
         await application.process_update(update)
         return web.Response(text="OK", status=200)
@@ -447,7 +449,10 @@ async def main():
     application.add_handler(CommandHandler("listgroups", list_groups_cmd))
     application.add_handler(CommandHandler("removegroup", remove_group_cmd))
     application.add_handler(CommandHandler("bindgroup", bind_group_cmd))
+    
+    # 关键修复：同时监听 MY_CHAT_MEMBER 和 CHAT_MEMBER
     application.add_handler(ChatMemberHandler(bot_added_to_group, ChatMemberHandler.MY_CHAT_MEMBER))
+    application.add_handler(ChatMemberHandler(bot_removed_from_group, ChatMemberHandler.MY_CHAT_MEMBER))
     
     # 创建 HTTP 应用
     app = web.Application()
@@ -478,7 +483,6 @@ async def main():
     
     if use_webhook and webhook_url:
         await application.initialize()
-        # 重要：设置 webhook 时指定接收所有更新类型，包括 chat_member
         await application.bot.set_webhook(
             url=webhook_url,
             allowed_updates=["message", "callback_query", "chat_member", "my_chat_member"]
