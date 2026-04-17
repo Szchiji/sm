@@ -24,6 +24,13 @@ WELCOME_TEXT = os.getenv("WELCOME_TEXT", "👋 欢迎！点击下方按钮加入
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 PORT = int(os.environ.get("PORT", 8080))
 
+# Railway 域名（支持多种可能的环境变量名）
+RAILWAY_DOMAIN = (
+    os.environ.get("RAILWAY_PUBLIC_DOMAIN") or 
+    os.environ.get("RAILWAY_URL") or 
+    os.environ.get("RAILWAY_STATIC_URL")
+)
+
 # Redis Key 前缀
 GROUPS_KEY = "tg_bot:groups"
 ADMINS_KEY = "tg_bot:admins"
@@ -223,7 +230,7 @@ async def bot_added_to_group(update: Update, context: ContextTypes.DEFAULT_TYPE)
 async def bot_removed_from_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """机器人被移除时清理"""
     chat = update.effective_chat
-    new_member = update.chat_member.new_member
+    new_member = update.chat_member.new_chat_member
     
     if new_member.user.id == context.bot.id and new_member.status in ['left', 'kicked']:
         remove_group(chat.id)
@@ -291,17 +298,39 @@ async def health_check(request):
     """健康检查端点"""
     return web.Response(text="OK", status=200)
 
-async def run_http_server():
-    """运行 HTTP 服务器供健康检查"""
-    app = web.Application()
-    app.router.add_get("/", health_check)
-    app.router.add_get("/health", health_check)
+async def webhook_handler(request):
+    """处理 Telegram Webhook 请求"""
+    application = request.app['application']
+    data = await request.json()
+    update = Update.de_json(data, application.bot)
+    await application.process_update(update)
+    return web.Response(text="OK", status=200)
+
+async def run_bot_with_webhook(application):
+    """使用 Webhook 模式运行机器人"""
+    webhook_url = f"https://{RAILWAY_DOMAIN}/webhook"
     
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", PORT)
-    await site.start()
-    logger.info(f"HTTP server started on port {PORT}")
+    await application.initialize()
+    await application.bot.set_webhook(url=webhook_url)
+    await application.start()
+    
+    logger.info(f"Webhook set to: {webhook_url}")
+    
+    # 保持运行
+    while True:
+        await asyncio.sleep(3600)
+
+async def run_bot_with_polling(application):
+    """使用 Polling 模式运行机器人（本地开发）"""
+    await application.initialize()
+    await application.start()
+    await application.updater.start_polling()
+    
+    logger.info("Bot started with polling")
+    
+    # 保持运行
+    while True:
+        await asyncio.sleep(3600)
 
 async def main():
     """主函数"""
@@ -320,33 +349,29 @@ async def main():
     application.add_handler(CommandHandler("removegroup", remove_group_cmd))
     application.add_handler(ChatMemberHandler(bot_added_to_group, ChatMemberHandler.MY_CHAT_MEMBER))
     
-    # 启动 HTTP 服务器（用于健康检查）
-    await run_http_server()
+    # 创建 HTTP 应用
+    app = web.Application()
+    app['application'] = application
     
-    # 启动机器人（使用 webhook 模式）
-    RAILWAY_STATIC_URL = os.environ.get("RAILWAY_STATIC_URL")
-    if RAILWAY_STATIC_URL:
-        await application.initialize()
-        await application.bot.set_webhook(
-            url=f"{RAILWAY_STATIC_URL}/webhook",
-            allowed_updates=Update.ALL_TYPES
-        )
-        await application.start()
-        logger.info("Bot started with webhook")
-        
-        # 保持运行
-        while True:
-            await asyncio.sleep(3600)
+    # 路由
+    app.router.add_get("/", health_check)
+    app.router.add_get("/health", health_check)
+    app.router.add_post("/webhook", webhook_handler)
+    
+    # 启动 HTTP 服务器
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", PORT)
+    await site.start()
+    logger.info(f"HTTP server started on port {PORT}")
+    
+    # 根据环境选择运行模式
+    if RAILWAY_DOMAIN:
+        # Railway 环境：使用 Webhook
+        await run_bot_with_webhook(application)
     else:
-        # 本地开发使用 polling
-        await application.initialize()
-        await application.start()
-        await application.updater.start_polling()
-        logger.info("Bot started with polling")
-        
-        # 保持运行
-        while True:
-            await asyncio.sleep(3600)
+        # 本地环境：使用 Polling
+        await run_bot_with_polling(application)
 
 if __name__ == "__main__":
     asyncio.run(main())
