@@ -153,7 +153,10 @@ def migrate_global_groups():
                 continue
             save_group(gid, info["title"], admin_id)
         # 重命名旧 key 以防止重复迁移
-        redis_client.rename(GROUPS_KEY, f"{GROUPS_KEY}:migrated")
+        try:
+            redis_client.rename(GROUPS_KEY, f"{GROUPS_KEY}:migrated")
+        except Exception as rename_err:
+            logger.warning(f"Could not rename old groups key: {rename_err}")
         logger.info("Migration complete")
     except Exception as e:
         logger.error(f"Migration failed: {e}")
@@ -514,16 +517,16 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         start_param = text.split(" ", 1)[1].strip()
     
     if not is_admin(user.id):
-        if start_param.startswith("join_") and not start_param.startswith("joinall_"):
-            try:
-                admin_id = int(start_param[len("join_"):])
-                await handle_join_flow(update, context, user, admin_id)
-            except (ValueError, IndexError):
-                await update.message.reply_text("链接无效，请联系管理员获取正确链接")
-        elif start_param.startswith("joinall_"):
+        if start_param.startswith("joinall_"):
             try:
                 admin_id = int(start_param[len("joinall_"):])
                 await handle_join_all(update, context, user, admin_id)
+            except (ValueError, IndexError):
+                await update.message.reply_text("链接无效，请联系管理员获取正确链接")
+        elif start_param.startswith("join_"):
+            try:
+                admin_id = int(start_param[len("join_"):])
+                await handle_join_flow(update, context, user, admin_id)
             except (ValueError, IndexError):
                 await update.message.reply_text("链接无效，请联系管理员获取正确链接")
         else:
@@ -556,16 +559,16 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"/test - 测试连接"
         )
         await update.message.reply_text(text)
-    elif start_param.startswith("join_") and not start_param.startswith("joinall_"):
-        try:
-            admin_id = int(start_param[len("join_"):])
-            await handle_join_flow(update, context, user, admin_id)
-        except (ValueError, IndexError):
-            await update.message.reply_text("链接无效")
     elif start_param.startswith("joinall_"):
         try:
             admin_id = int(start_param[len("joinall_"):])
             await handle_join_all(update, context, user, admin_id)
+        except (ValueError, IndexError):
+            await update.message.reply_text("链接无效")
+    elif start_param.startswith("join_"):
+        try:
+            admin_id = int(start_param[len("join_"):])
+            await handle_join_flow(update, context, user, admin_id)
         except (ValueError, IndexError):
             await update.message.reply_text("链接无效")
 
