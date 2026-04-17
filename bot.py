@@ -24,12 +24,15 @@ WELCOME_TEXT = os.getenv("WELCOME_TEXT", "👋 欢迎！点击下方按钮加入
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 PORT = int(os.environ.get("PORT", 8080))
 
-# Railway 域名（支持多种可能的环境变量名）
+# Railway 域名检测
 RAILWAY_DOMAIN = (
     os.environ.get("RAILWAY_PUBLIC_DOMAIN") or 
     os.environ.get("RAILWAY_URL") or 
     os.environ.get("RAILWAY_STATIC_URL")
 )
+
+# 手动设置 Webhook URL（优先级最高）
+WEBHOOK_URL = os.environ.get("WEBHOOK_URL")
 
 # Redis Key 前缀
 GROUPS_KEY = "tg_bot:groups"
@@ -293,7 +296,7 @@ async def remove_group_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("移除失败")
 
-# HTTP 健康检查
+# HTTP 处理
 async def health_check(request):
     """健康检查端点"""
     return web.Response(text="OK", status=200)
@@ -305,32 +308,6 @@ async def webhook_handler(request):
     update = Update.de_json(data, application.bot)
     await application.process_update(update)
     return web.Response(text="OK", status=200)
-
-async def run_bot_with_webhook(application):
-    """使用 Webhook 模式运行机器人"""
-    webhook_url = f"https://{RAILWAY_DOMAIN}/webhook"
-    
-    await application.initialize()
-    await application.bot.set_webhook(url=webhook_url)
-    await application.start()
-    
-    logger.info(f"Webhook set to: {webhook_url}")
-    
-    # 保持运行
-    while True:
-        await asyncio.sleep(3600)
-
-async def run_bot_with_polling(application):
-    """使用 Polling 模式运行机器人（本地开发）"""
-    await application.initialize()
-    await application.start()
-    await application.updater.start_polling()
-    
-    logger.info("Bot started with polling")
-    
-    # 保持运行
-    while True:
-        await asyncio.sleep(3600)
 
 async def main():
     """主函数"""
@@ -352,8 +329,6 @@ async def main():
     # 创建 HTTP 应用
     app = web.Application()
     app['application'] = application
-    
-    # 路由
     app.router.add_get("/", health_check)
     app.router.add_get("/health", health_check)
     app.router.add_post("/webhook", webhook_handler)
@@ -365,13 +340,38 @@ async def main():
     await site.start()
     logger.info(f"HTTP server started on port {PORT}")
     
-    # 根据环境选择运行模式
-    if RAILWAY_DOMAIN:
-        # Railway 环境：使用 Webhook
-        await run_bot_with_webhook(application)
+    # 确定运行模式
+    use_webhook = False
+    webhook_url = None
+    
+    if WEBHOOK_URL:
+        # 手动设置的 Webhook URL（优先级最高）
+        webhook_url = WEBHOOK_URL
+        use_webhook = True
+        logger.info(f"Using manually set webhook URL: {webhook_url}")
+    elif RAILWAY_DOMAIN:
+        # 自动检测的 Railway 域名
+        webhook_url = f"https://{RAILWAY_DOMAIN}/webhook"
+        use_webhook = True
+        logger.info(f"Using Railway domain: {RAILWAY_DOMAIN}")
+    
+    if use_webhook and webhook_url:
+        # Webhook 模式
+        await application.initialize()
+        await application.bot.set_webhook(url=webhook_url)
+        await application.start()
+        logger.info(f"Bot started with webhook: {webhook_url}")
     else:
-        # 本地环境：使用 Polling
-        await run_bot_with_polling(application)
+        # Polling 模式（仅本地开发）
+        logger.warning("No webhook URL configured, falling back to polling (local dev only)")
+        await application.initialize()
+        await application.start()
+        await application.updater.start_polling()
+        logger.info("Bot started with polling")
+    
+    # 保持运行
+    while True:
+        await asyncio.sleep(3600)
 
 if __name__ == "__main__":
     asyncio.run(main())
