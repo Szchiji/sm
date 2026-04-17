@@ -8,8 +8,8 @@ from datetime import datetime, timedelta
 from aiohttp import web
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
-    Application, CommandHandler, CallbackQueryHandler, 
-    ChatMemberHandler, ContextTypes
+    Application, CommandHandler, CallbackQueryHandler,
+    ChatMemberHandler, ContextTypes, MessageHandler, filters
 )
 
 # 日志配置
@@ -45,6 +45,8 @@ ADMINS_KEY = "tg_bot:admins"
 INVITE_LOG_KEY = "tg_bot:invite_log"
 USER_INVITE_PREFIX = "tg_bot:user_invite:"
 PENDING_REQUEST_PREFIX = "tg_bot:pending:"  # 待审批申请：key = pending:{user_id}_{group_id}
+ADMIN_STATE_PREFIX = "tg_bot:admin_state:"  # 管理员输入状态：key = admin_state:{user_id}
+ADMIN_STATE_TTL = 300  # 状态 5 分钟过期
 
 def groups_key(admin_id):
     """返回指定管理员的群组 Redis key"""
@@ -181,6 +183,27 @@ def delete_pending_request(user_id, group_id):
     if not redis_client:
         return
     redis_client.delete(f"{PENDING_REQUEST_PREFIX}{user_id}_{group_id}")
+
+# ============ 管理员输入状态管理 ============
+
+def get_admin_state(user_id):
+    """获取管理员当前输入状态"""
+    if not redis_client:
+        return None
+    data = redis_client.get(f"{ADMIN_STATE_PREFIX}{user_id}")
+    return json.loads(data) if data else None
+
+def set_admin_state(user_id, state: dict):
+    """设置管理员输入状态（5 分钟过期）"""
+    if not redis_client:
+        return
+    redis_client.setex(f"{ADMIN_STATE_PREFIX}{user_id}", ADMIN_STATE_TTL, json.dumps(state))
+
+def clear_admin_state(user_id):
+    """清除管理员输入状态"""
+    if not redis_client:
+        return
+    redis_client.delete(f"{ADMIN_STATE_PREFIX}{user_id}")
 
 def migrate_global_groups():
     """将旧全局群组数据迁移到按管理员隔离的 key"""
@@ -633,8 +656,39 @@ async def handle_join_all(update: Update, context: ContextTypes.DEFAULT_TYPE, us
         reply_markup=InlineKeyboardMarkup(keyboard_buttons) if keyboard_buttons else None
     )
 
+# ============ 管理员面板（按钮菜单）============
+
+def build_admin_main_keyboard():
+    """构建管理员主菜单键盘"""
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("📋 群组管理", callback_data="adm_groups"),
+            InlineKeyboardButton("📊 统计数据", callback_data="adm_stats"),
+        ],
+        [
+            InlineKeyboardButton("🔗 分享链接", callback_data="adm_links"),
+            InlineKeyboardButton("🧪 测试连接", callback_data="adm_test"),
+        ],
+        [
+            InlineKeyboardButton("🧹 清理数据", callback_data="adm_cleanup"),
+            InlineKeyboardButton("🚫 撤销链接", callback_data="adm_revoke"),
+        ],
+        [
+            InlineKeyboardButton("👥 添加管理员", callback_data="adm_addadmin"),
+        ],
+    ])
+
+def build_admin_main_text(user_id):
+    """构建管理员主菜单文本"""
+    groups = get_groups(user_id)
+    return (
+        f"🤖 管理员面板\n\n"
+        f"已绑定群组: {len(groups)} 个\n"
+        f"邀请有效期: {INVITE_EXPIRE_MINUTES}分钟\n"
+        f"邀请冷却: {INVITE_COOLDOWN_HOURS}小时"
+    )
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """用户点击链接开始"""
     user = update.effective_user
     text = update.message.text or ""
     logger.info(f"Start command from user: {user.id}, text: {text}")
@@ -663,31 +717,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     # 管理员面板
     if not start_param:
-        groups = get_groups(user.id)
-        admin_ids = get_admin_ids_from_env()
-        
-        text = (
-            f"欢迎管理员！\n\n"
-            f"当前状态：\n"
-            f"已绑定群组: {len(groups)} 个\n"
-            f"管理员ID: {', '.join(map(str, admin_ids))}\n"
-            f"邀请有效期: {INVITE_EXPIRE_MINUTES}分钟\n"
-            f"邀请冷却: {INVITE_COOLDOWN_HOURS}小时\n\n"
-            f"用户链接（仅包含你的群组）：\n"
-            f"• 选择加入: https://t.me/{context.bot.username}?start=join_{user.id}\n"
-            f"• 加入全部: https://t.me/{context.bot.username}?start=joinall_{user.id}\n\n"
-            f"管理员命令：\n"
-            f"/addadmin [用户ID]\n"
-            f"/listgroups\n"
-            f"/removegroup [群组ID]\n"
-            f"/bindgroup [群组ID] [群组名称]\n"
-            f"/setapproval [群组ID] - 切换审批模式（开/关）\n"
-            f"/stats - 查看统计\n"
-            f"/cleanup - 清理过期数据\n"
-            f"/revoke - 立即撤销失效链接\n"
-            f"/test - 测试连接"
+        clear_admin_state(user.id)
+        await update.message.reply_text(
+            build_admin_main_text(user.id),
+            reply_markup=build_admin_main_keyboard()
         )
-        await update.message.reply_text(text)
     elif start_param.startswith("joinall_"):
         try:
             admin_id = int(start_param[len("joinall_"):])
@@ -1013,6 +1047,330 @@ async def reject_request_callback(update: Update, context: ContextTypes.DEFAULT_
 
     await query.edit_message_text(f"❌ 已拒绝用户 {user_id} 加入「{group_title}」")
     logger.info(f"Admin {query.from_user.id} rejected join request: user {user_id} -> group {group_id}")
+
+async def admin_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """处理管理员面板的所有 adm_* 回调按钮"""
+    query = update.callback_query
+    user = query.from_user
+
+    if not is_admin(user.id):
+        await query.answer("⛔ 你没有权限", show_alert=True)
+        return
+
+    # 任何按钮点击都清除输入状态
+    clear_admin_state(user.id)
+
+    data = query.data
+    back_btn = [[InlineKeyboardButton("⬅️ 返回", callback_data="adm_back")]]
+
+    # ── 主菜单 / 返回 ──────────────────────────────────────────────────────────
+    if data == "adm_back":
+        await query.answer()
+        await query.edit_message_text(
+            build_admin_main_text(user.id),
+            reply_markup=build_admin_main_keyboard()
+        )
+        return
+
+    # ── 群组列表 ───────────────────────────────────────────────────────────────
+    if data == "adm_groups":
+        await query.answer()
+        groups = get_groups(user.id)
+        keyboard = []
+        if groups:
+            for gid, info in groups.items():
+                icon = "🔒" if info.get('approval_required', False) else "🔓"
+                keyboard.append([InlineKeyboardButton(
+                    f"{icon} {info['title']}",
+                    callback_data=f"adm_grp_info_{gid}"
+                )])
+        keyboard.append([InlineKeyboardButton("➕ 手动绑定群组", callback_data="adm_bindgroup")])
+        keyboard.append([InlineKeyboardButton("⬅️ 返回", callback_data="adm_back")])
+        msg = (f"📋 已绑定群组（{len(groups)} 个）\n🔓=直接加入  🔒=需审批"
+               if groups else "暂无绑定的群组\n\n将机器人设为群管理员后即可自动绑定")
+        await query.edit_message_text(msg, reply_markup=InlineKeyboardMarkup(keyboard))
+        return
+
+    # ── 群组详情 ───────────────────────────────────────────────────────────────
+    if data.startswith("adm_grp_info_"):
+        await query.answer()
+        gid = data[len("adm_grp_info_"):]
+        groups = get_groups(user.id)
+        if gid not in groups:
+            await query.edit_message_text(
+                "该群组不存在",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ 返回", callback_data="adm_groups")]])
+            )
+            return
+        info = groups[gid]
+        approval = "🔒 需审批" if info.get('approval_required', False) else "🔓 直接加入"
+        toggle_label = "🔓 切换为直接加入" if info.get('approval_required', False) else "🔒 切换为需审批"
+        keyboard = [
+            [InlineKeyboardButton(toggle_label, callback_data=f"adm_grp_tog_{gid}")],
+            [InlineKeyboardButton("❌ 移除群组", callback_data=f"adm_grp_del_{gid}")],
+            [InlineKeyboardButton("⬅️ 返回群组列表", callback_data="adm_groups")],
+        ]
+        await query.edit_message_text(
+            f"群组：{info['title']}\nID: `{gid}`\n审批模式: {approval}",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode="Markdown"
+        )
+        return
+
+    # ── 切换审批模式 ───────────────────────────────────────────────────────────
+    if data.startswith("adm_grp_tog_"):
+        gid = data[len("adm_grp_tog_"):]
+        groups = get_groups(user.id)
+        if gid not in groups:
+            await query.answer("群组不存在", show_alert=True)
+            return
+        current = groups[gid].get('approval_required', False)
+        set_group_approval(gid, user.id, not current)
+        status = "开启 🔒" if not current else "关闭 🔓"
+        await query.answer(f"审批模式已{status}")
+        # 刷新群组详情
+        groups = get_groups(user.id)
+        info = groups[gid]
+        approval = "🔒 需审批" if info.get('approval_required', False) else "🔓 直接加入"
+        toggle_label = "🔓 切换为直接加入" if info.get('approval_required', False) else "🔒 切换为需审批"
+        keyboard = [
+            [InlineKeyboardButton(toggle_label, callback_data=f"adm_grp_tog_{gid}")],
+            [InlineKeyboardButton("❌ 移除群组", callback_data=f"adm_grp_del_{gid}")],
+            [InlineKeyboardButton("⬅️ 返回群组列表", callback_data="adm_groups")],
+        ]
+        await query.edit_message_text(
+            f"群组：{info['title']}\nID: `{gid}`\n审批模式: {approval}",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode="Markdown"
+        )
+        return
+
+    # ── 确认移除群组 ───────────────────────────────────────────────────────────
+    if data.startswith("adm_grp_delok_"):
+        await query.answer()
+        gid = data[len("adm_grp_delok_"):]
+        groups = get_groups(user.id)
+        title = groups.get(gid, {}).get('title', gid)
+        result = remove_group(gid)
+        msg = f"✅ 已移除群组「{title}」" if result else "❌ 移除失败"
+        await query.edit_message_text(
+            msg,
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ 返回群组列表", callback_data="adm_groups")]])
+        )
+        return
+
+    # ── 提示确认移除 ──────────────────────────────────────────────────────────
+    if data.startswith("adm_grp_del_"):
+        await query.answer()
+        gid = data[len("adm_grp_del_"):]
+        groups = get_groups(user.id)
+        if gid not in groups:
+            await query.answer("群组不存在", show_alert=True)
+            return
+        info = groups[gid]
+        keyboard = [[
+            InlineKeyboardButton("✅ 确认移除", callback_data=f"adm_grp_delok_{gid}"),
+            InlineKeyboardButton("取消", callback_data=f"adm_grp_info_{gid}"),
+        ]]
+        await query.edit_message_text(
+            f"⚠️ 确认移除群组「{info['title']}」？",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        return
+
+    # ── 统计数据 ───────────────────────────────────────────────────────────────
+    if data == "adm_stats":
+        await query.answer()
+        if not redis_client:
+            await query.edit_message_text("Redis 不可用", reply_markup=InlineKeyboardMarkup(back_btn))
+            return
+        logs = redis_client.lrange(INVITE_LOG_KEY, 0, 999)
+        recent_invites = []
+        revoked_count = 0
+        for log in logs:
+            try:
+                entry = json.loads(log)
+                if str(entry.get('admin_id')) != str(user.id):
+                    continue
+                if entry.get('revoked', False):
+                    revoked_count += 1
+                created = datetime.fromisoformat(entry['created_at'])
+                if datetime.now() - created < timedelta(days=1):
+                    recent_invites.append(entry)
+            except:
+                continue
+        total_24h = len(recent_invites)
+        unique_users = len(set(i['user_id'] for i in recent_invites))
+        text = (
+            f"📊 邀请统计（最近24小时）\n\n"
+            f"总邀请数: {total_24h}\n"
+            f"独立用户: {unique_users}\n"
+            f"已撤销链接: {revoked_count}\n\n"
+            f"配置:\n"
+            f"邀请有效期: {INVITE_EXPIRE_MINUTES}分钟\n"
+            f"邀请冷却: {INVITE_COOLDOWN_HOURS}小时"
+        )
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(back_btn))
+        return
+
+    # ── 分享链接 ───────────────────────────────────────────────────────────────
+    if data == "adm_links":
+        await query.answer()
+        bot_username = context.bot.username
+        text = (
+            f"🔗 分享链接（仅包含你的群组）：\n\n"
+            f"• 选择加入：\nhttps://t.me/{bot_username}?start=join_{user.id}\n\n"
+            f"• 一键加入全部：\nhttps://t.me/{bot_username}?start=joinall_{user.id}"
+        )
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(back_btn))
+        return
+
+    # ── 测试连接 ───────────────────────────────────────────────────────────────
+    if data == "adm_test":
+        await query.answer()
+        redis_status = "连接正常" if redis_client and redis_client.ping() else "连接失败"
+        groups = get_groups(user.id)
+        text = (
+            f"🧪 测试报告\n\n"
+            f"Redis 状态: {redis_status}\n"
+            f"已绑定群组: {len(groups)} 个\n"
+            f"邀请有效期: {INVITE_EXPIRE_MINUTES}分钟\n"
+            f"邀请冷却: {INVITE_COOLDOWN_HOURS}小时\n"
+            f"当前用户ID: {user.id}\n"
+            f"是否为管理员: 是"
+        )
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(back_btn))
+        return
+
+    # ── 清理数据 ───────────────────────────────────────────────────────────────
+    if data == "adm_cleanup":
+        await query.answer()
+        await query.edit_message_text("🧹 正在清理过期数据...")
+        removed = await cleanup_expired_invites()
+        if redis_client:
+            logs = redis_client.lrange(INVITE_LOG_KEY, 0, -1)
+            valid = expired = revoked = 0
+            for log in logs:
+                try:
+                    entry = json.loads(log)
+                    if entry.get('revoked', False):
+                        revoked += 1
+                    elif datetime.fromisoformat(entry['expire_at']) > datetime.now():
+                        valid += 1
+                    else:
+                        expired += 1
+                except:
+                    expired += 1
+            text = (
+                f"✅ 清理完成\n\n"
+                f"🗑️ 已删除记录: {removed}\n"
+                f"✨ 有效邀请: {valid}\n"
+                f"⏰ 待撤销: {expired}\n"
+                f"🚫 已撤销: {revoked}\n"
+                f"📊 总计: {len(logs)}"
+            )
+        else:
+            text = "❌ Redis 不可用"
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(back_btn))
+        return
+
+    # ── 撤销链接 ───────────────────────────────────────────────────────────────
+    if data == "adm_revoke":
+        await query.answer()
+        await query.edit_message_text("🚫 正在撤销失效的邀请链接...")
+        revoked = await revoke_expired_invites(context.application)
+        await query.edit_message_text(
+            f"✅ 已撤销 {revoked} 个失效的邀请链接",
+            reply_markup=InlineKeyboardMarkup(back_btn)
+        )
+        return
+
+    # ── 添加管理员（等待输入）─────────────────────────────────────────────────
+    if data == "adm_addadmin":
+        await query.answer()
+        set_admin_state(user.id, {"action": "add_admin"})
+        await query.edit_message_text(
+            "👥 请发送要添加的管理员用户 ID：\n（点击「取消」或发送 /cancel 可退出）",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("取消", callback_data="adm_back")]])
+        )
+        return
+
+    # ── 手动绑定群组（等待输入）───────────────────────────────────────────────
+    if data == "adm_bindgroup":
+        await query.answer()
+        set_admin_state(user.id, {"action": "bind_group_id"})
+        await query.edit_message_text(
+            "➕ 请发送要绑定的群组 ID：\n（例如：-1001234567890）\n（点击「取消」或发送 /cancel 可退出）",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("取消", callback_data="adm_groups")]])
+        )
+        return
+
+async def admin_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """处理管理员在输入状态下发送的文本消息"""
+    user = update.effective_user
+    if not is_admin(user.id):
+        return
+
+    state = get_admin_state(user.id)
+    if not state:
+        return
+
+    text = update.message.text.strip()
+    action = state.get("action")
+
+    if action == "add_admin":
+        try:
+            new_admin_id = int(text)
+        except ValueError:
+            await update.message.reply_text("❌ 无效的用户 ID，请发送纯数字")
+            return
+        if not redis_client:
+            await update.message.reply_text("❌ 系统错误：Redis 不可用")
+            clear_admin_state(user.id)
+            return
+        redis_client.sadd(ADMINS_KEY, str(new_admin_id))
+        clear_admin_state(user.id)
+        await update.message.reply_text(
+            f"✅ 已添加管理员: {new_admin_id}",
+            reply_markup=build_admin_main_keyboard()
+        )
+        return
+
+    if action == "bind_group_id":
+        try:
+            group_id = int(text)
+        except ValueError:
+            await update.message.reply_text("❌ 无效的群组 ID，请发送数字（如 -1001234567890）")
+            return
+        set_admin_state(user.id, {"action": "bind_group_name", "group_id": str(group_id)})
+        await update.message.reply_text(f"✅ 群组 ID: {group_id}\n\n请继续发送群组名称：")
+        return
+
+    if action == "bind_group_name":
+        group_id = state.get("group_id")
+        group_title = text
+        clear_admin_state(user.id)
+        if save_group(group_id, group_title, user.id):
+            bot_username = context.bot.username
+            await update.message.reply_text(
+                f"✅ 已绑定群组：{group_title}\n"
+                f"分享链接：https://t.me/{bot_username}?start=join_{user.id}",
+                reply_markup=build_admin_main_keyboard()
+            )
+        else:
+            await update.message.reply_text("❌ 绑定失败", reply_markup=build_admin_main_keyboard())
+        return
+
+async def cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """取消当前输入状态，返回管理员主菜单"""
+    user = update.effective_user
+    if not is_admin(user.id):
+        return
+    clear_admin_state(user.id)
+    await update.message.reply_text(
+        build_admin_main_text(user.id),
+        reply_markup=build_admin_main_keyboard()
+    )
 
 async def set_approval_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """切换群组的审批模式（开/关）"""
@@ -1384,6 +1742,7 @@ async def main():
     
     # 命令处理器
     application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("cancel", cancel_cmd))
     application.add_handler(CommandHandler("test", test_cmd))
     application.add_handler(CommandHandler("stats", stats_cmd))
     application.add_handler(CommandHandler("cleanup", cleanup_cmd))
@@ -1393,8 +1752,12 @@ async def main():
     application.add_handler(CommandHandler("removegroup", remove_group_cmd))
     application.add_handler(CommandHandler("bindgroup", bind_group_cmd))
     application.add_handler(CommandHandler("setapproval", set_approval_cmd))
-    
+
+    # 管理员文本输入处理器（状态机）
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, admin_message_handler))
+
     # 回调处理器
+    application.add_handler(CallbackQueryHandler(admin_callback_handler, pattern="^adm_"))
     application.add_handler(CallbackQueryHandler(approve_request_callback, pattern="^approve_"))
     application.add_handler(CallbackQueryHandler(reject_request_callback, pattern="^reject_"))
     application.add_handler(CallbackQueryHandler(select_group_callback, pattern="^select_"))
