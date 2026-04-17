@@ -38,10 +38,16 @@ RAILWAY_DOMAIN = (
 WEBHOOK_URL = os.environ.get("WEBHOOK_URL")
 
 # Redis Key 前缀
-GROUPS_KEY = "tg_bot:groups"
+GROUPS_KEY = "tg_bot:groups"           # 旧全局 key（仅用于迁移）
+GROUPS_PREFIX = "tg_bot:groups:"       # 新按管理员隔离的 key，后跟 admin_id
+GROUP_OWNER_PREFIX = "tg_bot:group_owner:"  # 反向查找：group_id -> admin_id
 ADMINS_KEY = "tg_bot:admins"
 INVITE_LOG_KEY = "tg_bot:invite_log"
 USER_INVITE_PREFIX = "tg_bot:user_invite:"
+
+def groups_key(admin_id):
+    """返回指定管理员的群组 Redis key"""
+    return f"{GROUPS_PREFIX}{admin_id}"
 
 # 连接 Redis
 try:
@@ -77,48 +83,83 @@ def init_admin_from_env():
     for admin_id in env_admins:
         redis_client.sadd(ADMINS_KEY, str(admin_id))
 
-def get_groups():
-    """从 Redis 获取所有群组"""
+def get_groups(admin_id):
+    """从 Redis 获取指定管理员的群组"""
     if not redis_client:
         return {}
     try:
-        data = redis_client.get(GROUPS_KEY)
+        data = redis_client.get(groups_key(admin_id))
         return json.loads(data) if data else {}
     except Exception as e:
         logger.error(f"Failed to get groups from Redis: {e}")
         return {}
 
 def save_group(group_id, title, added_by):
-    """保存群组到 Redis"""
+    """保存群组到 Redis（按管理员隔离）"""
     if not redis_client:
         logger.error("Redis not available")
         return False
     try:
-        groups = get_groups()
+        groups = get_groups(added_by)
         groups[str(group_id)] = {
             "title": title,
             "added_by": added_by,
             "invite_link": None
         }
-        redis_client.set(GROUPS_KEY, json.dumps(groups))
-        logger.info(f"Group saved to Redis: {title} ({group_id})")
+        redis_client.set(groups_key(added_by), json.dumps(groups))
+        # 记录反向查找：group_id -> admin_id
+        redis_client.set(f"{GROUP_OWNER_PREFIX}{group_id}", str(added_by))
+        logger.info(f"Group saved to Redis: {title} ({group_id}) for admin {added_by}")
         return True
     except Exception as e:
         logger.error(f"Failed to save group: {e}")
         return False
 
 def remove_group(group_id):
-    """从 Redis 删除群组"""
+    """从 Redis 删除群组（通过反向查找定位所属管理员）"""
     if not redis_client:
         return False
     try:
-        groups = get_groups()
+        owner_key = f"{GROUP_OWNER_PREFIX}{group_id}"
+        admin_id = redis_client.get(owner_key)
+        if not admin_id:
+            logger.warning(f"No owner found for group {group_id}")
+            return False
+        groups = get_groups(admin_id)
         groups.pop(str(group_id), None)
-        redis_client.set(GROUPS_KEY, json.dumps(groups))
+        redis_client.set(groups_key(admin_id), json.dumps(groups))
+        redis_client.delete(owner_key)
         return True
     except Exception as e:
         logger.error(f"Failed to remove group: {e}")
         return False
+
+def migrate_global_groups():
+    """将旧全局群组数据迁移到按管理员隔离的 key"""
+    if not redis_client:
+        return
+    try:
+        data = redis_client.get(GROUPS_KEY)
+        if not data:
+            return
+        global_groups = json.loads(data)
+        if not global_groups:
+            return
+        logger.info(f"Migrating {len(global_groups)} groups from global key to per-admin keys...")
+        for gid, info in global_groups.items():
+            admin_id = info.get("added_by")
+            if not admin_id:
+                logger.warning(f"Group {gid} has no added_by, skipping migration")
+                continue
+            save_group(gid, info["title"], admin_id)
+        # 重命名旧 key 以防止重复迁移
+        try:
+            redis_client.rename(GROUPS_KEY, f"{GROUPS_KEY}:migrated")
+        except Exception as rename_err:
+            logger.warning(f"Could not rename old groups key: {rename_err}")
+        logger.info("Migration complete")
+    except Exception as e:
+        logger.error(f"Migration failed: {e}")
 
 def can_user_get_invite(user_id, group_id):
     """检查用户是否可以获取邀请（冷却时间限制）"""
@@ -138,7 +179,7 @@ def record_user_invite(user_id, group_id):
     key = f"{USER_INVITE_PREFIX}{user_id}:{group_id}"
     redis_client.setex(key, INVITE_COOLDOWN_HOURS * 3600, datetime.now().isoformat())
 
-def log_invite(user_id, group_id, invite_link, group_title):
+def log_invite(user_id, group_id, invite_link, group_title, admin_id=None):
     """记录邀请日志"""
     if not redis_client:
         return
@@ -147,6 +188,7 @@ def log_invite(user_id, group_id, invite_link, group_title):
         "group_id": group_id,
         "group_title": group_title,
         "invite_link": invite_link,
+        "admin_id": admin_id,
         "created_at": datetime.now().isoformat(),
         "expire_at": (datetime.now() + timedelta(minutes=INVITE_EXPIRE_MINUTES)).isoformat(),
         "revoked": False
@@ -314,7 +356,7 @@ async def cleanup_expired_data(application: Application):
 
 # ============ 业务逻辑 ============
 
-async def send_single_invite(update, context, user, group_id, group_title):
+async def send_single_invite(update, context, user, group_id, group_title, admin_id=None):
     """发送单个邀请"""
     can_get, ttl = can_user_get_invite(user.id, group_id)
     if not can_get:
@@ -332,7 +374,7 @@ async def send_single_invite(update, context, user, group_id, group_title):
             expire_date=expire_time
         )
         
-        log_invite(user.id, group_id, invite_link.invite_link, group_title)
+        log_invite(user.id, group_id, invite_link.invite_link, group_title, admin_id)
         record_user_invite(user.id, group_id)
         
         keyboard = [[InlineKeyboardButton(f"👉 加入 {group_title}", url=invite_link.invite_link)]]
@@ -347,10 +389,10 @@ async def send_single_invite(update, context, user, group_id, group_title):
         await update.message.reply_text(f"❌ {group_title} 邀请生成失败")
         return False
 
-async def handle_join_flow(update: Update, context: ContextTypes.DEFAULT_TYPE, user):
+async def handle_join_flow(update: Update, context: ContextTypes.DEFAULT_TYPE, user, admin_id):
     """处理用户加入流程（选择单个群组）"""
-    groups = get_groups()
-    logger.info(f"Current groups: {groups}")
+    groups = get_groups(admin_id)
+    logger.info(f"Current groups for admin {admin_id}: {groups}")
     
     if not groups:
         await update.message.reply_text("机器人尚未配置群组，请联系管理员")
@@ -359,7 +401,7 @@ async def handle_join_flow(update: Update, context: ContextTypes.DEFAULT_TYPE, u
     # 只有一个群组，直接处理
     if len(groups) == 1:
         group_id = list(groups.keys())[0]
-        await send_single_invite(update, context, user, group_id, list(groups.values())[0]['title'])
+        await send_single_invite(update, context, user, group_id, list(groups.values())[0]['title'], admin_id)
         return
     
     # 多个群组，显示选择菜单
@@ -373,13 +415,13 @@ async def handle_join_flow(update: Update, context: ContextTypes.DEFAULT_TYPE, u
         
         keyboard.append([InlineKeyboardButton(
             f"{info['title']}{status}", 
-            callback_data=f"select_{gid}_{user.id}"
+            callback_data=f"select_{gid}_{user.id}_{admin_id}"
         )])
     
     # 添加"加入全部"选项
     keyboard.append([InlineKeyboardButton(
         "🚀 一键加入所有群组", 
-        callback_data=f"joinall_{user.id}"
+        callback_data=f"joinall_{user.id}_{admin_id}"
     )])
     
     await update.message.reply_text(
@@ -388,9 +430,9 @@ async def handle_join_flow(update: Update, context: ContextTypes.DEFAULT_TYPE, u
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
 
-async def handle_join_all(update: Update, context: ContextTypes.DEFAULT_TYPE, user):
+async def handle_join_all(update: Update, context: ContextTypes.DEFAULT_TYPE, user, admin_id):
     """处理批量加入所有群组"""
-    groups = get_groups()
+    groups = get_groups(admin_id)
     
     if not groups:
         await update.message.reply_text("机器人尚未配置群组，请联系管理员")
@@ -399,7 +441,7 @@ async def handle_join_all(update: Update, context: ContextTypes.DEFAULT_TYPE, us
     # 只有一个群组，直接处理
     if len(groups) == 1:
         group_id = list(groups.keys())[0]
-        await send_single_invite(update, context, user, group_id, list(groups.values())[0]['title'])
+        await send_single_invite(update, context, user, group_id, list(groups.values())[0]['title'], admin_id)
         return
     
     # 检查每个群组的冷却状态
@@ -424,47 +466,76 @@ async def handle_join_all(update: Update, context: ContextTypes.DEFAULT_TYPE, us
     if len(available_groups) == 1:
         # 只有一个可用，直接发送
         gid, title = available_groups[0]
-        await send_single_invite(update, context, user, gid, title)
+        await send_single_invite(update, context, user, gid, title, admin_id)
         return
     
-    # 多个可用，显示确认按钮
-    text = f"📋 发现 {len(available_groups)} 个可加入的群组：\n\n"
-    for i, (gid, title) in enumerate(available_groups, 1):
-        text += f"{i}. {title}\n"
+    # 多个可用，直接生成所有邀请链接，无需确认
+    processing_msg = await update.message.reply_text("⏳ 正在生成邀请链接，请稍候...")
     
+    keyboard_buttons = []
+    failed_groups = []
+    success_count = 0
+    
+    for gid, title in available_groups:
+        try:
+            expire_time = int((datetime.now() + timedelta(minutes=INVITE_EXPIRE_MINUTES)).timestamp())
+            invite_link = await context.bot.create_chat_invite_link(
+                chat_id=int(gid),
+                member_limit=1,
+                expire_date=expire_time
+            )
+            log_invite(user.id, gid, invite_link.invite_link, title, admin_id)
+            record_user_invite(user.id, gid)
+            keyboard_buttons.append([InlineKeyboardButton(f"👉 加入 {title}", url=invite_link.invite_link)])
+            success_count += 1
+        except Exception as e:
+            logger.error(f"Failed to create invite for {gid}: {e}")
+            failed_groups.append(title)
+    
+    text = f"✅ 已生成 {success_count} 个邀请链接\n"
     if cooling_groups:
-        text += f"\n⏳ {len(cooling_groups)} 个群组冷却中\n"
+        text += f"⏳ {len(cooling_groups)} 个群组冷却中\n"
+    if failed_groups:
+        text += f"❌ {len(failed_groups)} 个群组生成失败\n"
+    text += f"\n⏰ 链接将在 {INVITE_EXPIRE_MINUTES} 分钟后过期\n"
+    text += "🔒 每个链接仅限使用一次"
     
-    text += f"\n⏰ 邀请链接 {INVITE_EXPIRE_MINUTES} 分钟后过期\n"
-    text += f"🎫 每群组每 {INVITE_COOLDOWN_HOURS} 小时限领一次"
-    
-    keyboard = [[InlineKeyboardButton(
-        "🚀 一键加入所有群组", 
-        callback_data=f"joinall_{user.id}"
-    )]]
-    
-    await update.message.reply_text(
+    await processing_msg.edit_text(
         text,
-        reply_markup=InlineKeyboardMarkup(keyboard)
+        reply_markup=InlineKeyboardMarkup(keyboard_buttons) if keyboard_buttons else None
     )
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """用户点击链接开始"""
     user = update.effective_user
-    logger.info(f"Start command from user: {user.id}, text: {update.message.text}")
+    text = update.message.text or ""
+    logger.info(f"Start command from user: {user.id}, text: {text}")
+    
+    # 解析 start 参数：/start join_{admin_id} 或 /start joinall_{admin_id}
+    start_param = ""
+    if " " in text:
+        start_param = text.split(" ", 1)[1].strip()
     
     if not is_admin(user.id):
-        if update.message.text == "/start join":
-            await handle_join_flow(update, context, user)
-        elif update.message.text == "/start joinall":
-            await handle_join_all(update, context, user)
+        if start_param.startswith("joinall_"):
+            try:
+                admin_id = int(start_param[len("joinall_"):])
+                await handle_join_all(update, context, user, admin_id)
+            except (ValueError, IndexError):
+                await update.message.reply_text("链接无效，请联系管理员获取正确链接")
+        elif start_param.startswith("join_"):
+            try:
+                admin_id = int(start_param[len("join_"):])
+                await handle_join_flow(update, context, user, admin_id)
+            except (ValueError, IndexError):
+                await update.message.reply_text("链接无效，请联系管理员获取正确链接")
         else:
             await update.message.reply_text("此机器人仅限授权管理员使用")
         return
     
     # 管理员面板
-    if update.message.text == "/start":
-        groups = get_groups()
+    if not start_param:
+        groups = get_groups(user.id)
         admin_ids = get_admin_ids_from_env()
         
         text = (
@@ -474,9 +545,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"管理员ID: {', '.join(map(str, admin_ids))}\n"
             f"邀请有效期: {INVITE_EXPIRE_MINUTES}分钟\n"
             f"邀请冷却: {INVITE_COOLDOWN_HOURS}小时\n\n"
-            f"用户链接：\n"
-            f"• 选择加入: https://t.me/{context.bot.username}?start=join\n"
-            f"• 加入全部: https://t.me/{context.bot.username}?start=joinall\n\n"
+            f"用户链接（仅包含你的群组）：\n"
+            f"• 选择加入: https://t.me/{context.bot.username}?start=join_{user.id}\n"
+            f"• 加入全部: https://t.me/{context.bot.username}?start=joinall_{user.id}\n\n"
             f"管理员命令：\n"
             f"/addadmin [用户ID]\n"
             f"/listgroups\n"
@@ -488,10 +559,18 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"/test - 测试连接"
         )
         await update.message.reply_text(text)
-    elif update.message.text == "/start join":
-        await handle_join_flow(update, context, user)
-    elif update.message.text == "/start joinall":
-        await handle_join_all(update, context, user)
+    elif start_param.startswith("joinall_"):
+        try:
+            admin_id = int(start_param[len("joinall_"):])
+            await handle_join_all(update, context, user, admin_id)
+        except (ValueError, IndexError):
+            await update.message.reply_text("链接无效")
+    elif start_param.startswith("join_"):
+        try:
+            admin_id = int(start_param[len("join_"):])
+            await handle_join_flow(update, context, user, admin_id)
+        except (ValueError, IndexError):
+            await update.message.reply_text("链接无效")
 
 async def select_group_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """处理群组选择"""
@@ -499,14 +578,19 @@ async def select_group_callback(update: Update, context: ContextTypes.DEFAULT_TY
     await query.answer()
     
     data = query.data.split("_")
+    # format: select_{group_id}_{user_id}_{admin_id}
+    if len(data) < 4:
+        await query.edit_message_text("链接已失效，请重新获取")
+        return
     group_id = data[1]
     user_id = int(data[2])
+    admin_id = int(data[3])
     
     if query.from_user.id != user_id:
         await query.answer("这不是你的选择", show_alert=True)
         return
     
-    groups = get_groups()
+    groups = get_groups(admin_id)
     if group_id not in groups:
         await query.edit_message_text("该群组已不可用")
         return
@@ -523,17 +607,30 @@ async def select_group_callback(update: Update, context: ContextTypes.DEFAULT_TY
     
     group_title = groups[group_id]['title']
     
-    keyboard = [[InlineKeyboardButton(
-        f"🚀 加入 {group_title}", 
-        callback_data=f"join_{group_id}_{user_id}"
-    )]]
-    
-    await query.edit_message_text(
-        f"👋 欢迎加入 {group_title}！\n\n"
-        f"⏰ 邀请链接将在 {INVITE_EXPIRE_MINUTES} 分钟后过期\n"
-        f"🎫 每人每 {INVITE_COOLDOWN_HOURS} 小时限领一次",
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
+    # 直接生成邀请链接，无需二次确认
+    try:
+        expire_time = int((datetime.now() + timedelta(minutes=INVITE_EXPIRE_MINUTES)).timestamp())
+        invite_link = await context.bot.create_chat_invite_link(
+            chat_id=int(group_id),
+            member_limit=1,
+            expire_date=expire_time
+        )
+        
+        log_invite(user_id, group_id, invite_link.invite_link, group_title, admin_id)
+        record_user_invite(user_id, group_id)
+        
+        keyboard = [[InlineKeyboardButton(f"👉 点击加入 {group_title}", url=invite_link.invite_link)]]
+        await query.edit_message_text(
+            f"✅ {group_title}\n\n"
+            f"⏰ 链接将在 {INVITE_EXPIRE_MINUTES} 分钟后过期\n"
+            f"🔒 仅限你使用一次",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        logger.info(f"User {user_id} got invite link for group {group_id}")
+        
+    except Exception as e:
+        logger.error(f"Failed to create invite: {e}")
+        await query.edit_message_text(f"❌ {group_title} 邀请生成失败，请联系管理员")
 
 async def join_all_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """处理一键加入所有群组的回调"""
@@ -541,13 +638,18 @@ async def join_all_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     
     data = query.data.split("_")
+    # format: joinall_{user_id}_{admin_id}
+    if len(data) < 3:
+        await query.edit_message_text("链接已失效，请重新获取")
+        return
     user_id = int(data[1])
+    admin_id = int(data[2])
     
     if query.from_user.id != user_id:
         await query.answer("这不是你的请求", show_alert=True)
         return
     
-    groups = get_groups()
+    groups = get_groups(admin_id)
     results = []
     success_count = 0
     
@@ -571,7 +673,7 @@ async def join_all_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             
             # 记录
-            log_invite(user_id, gid, invite_link.invite_link, info['title'])
+            log_invite(user_id, gid, invite_link.invite_link, info['title'], admin_id)
             record_user_invite(user_id, gid)
             
             results.append(f"✅ [{info['title']}]({invite_link.invite_link})")
@@ -628,9 +730,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         
         # 记录邀请
-        groups = get_groups()
+        admin_id_str = redis_client.get(f"{GROUP_OWNER_PREFIX}{group_id}") if redis_client else None
+        admin_id = int(admin_id_str) if admin_id_str else None
+        groups = get_groups(admin_id) if admin_id else {}
         group_title = groups.get(group_id, {}).get('title', 'Unknown')
-        log_invite(user_id, group_id, invite_link.invite_link, group_title)
+        log_invite(user_id, group_id, invite_link.invite_link, group_title, admin_id)
         record_user_invite(user_id, group_id)
         
         keyboard = [[InlineKeyboardButton("👉 点击加入群组", url=invite_link.invite_link)]]
@@ -721,7 +825,7 @@ async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Redis 不可用")
         return
     
-    # 获取最近24小时的邀请记录
+    # 获取最近24小时属于该管理员的邀请记录
     logs = redis_client.lrange(INVITE_LOG_KEY, 0, 999)
     recent_invites = []
     revoked_count = 0
@@ -729,6 +833,8 @@ async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for log in logs:
         try:
             entry = json.loads(log)
+            if str(entry.get('admin_id')) != str(user.id):
+                continue
             if entry.get('revoked', False):
                 revoked_count += 1
             created = datetime.fromisoformat(entry['created_at'])
@@ -762,7 +868,7 @@ async def test_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     redis_status = "连接正常" if redis_client and redis_client.ping() else "连接失败"
-    groups = get_groups()
+    groups = get_groups(user.id)
     admin_ids = get_admin_ids_from_env()
     
     text = (
@@ -820,7 +926,9 @@ async def bot_added_to_group(update: Update, context: ContextTypes.DEFAULT_TYPE)
                     chat_id=added_by.id,
                     text=f"✅ 机器人已成功绑定到群组「{chat.title}」\n"
                          f"群组ID: `{chat.id}`\n"
-                         f"分享链接：https://t.me/{context.bot.username}?start=join",
+                         f"分享链接（仅包含你的群组）：\n"
+                         f"• 选择加入: https://t.me/{context.bot.username}?start=join_{added_by.id}\n"
+                         f"• 加入全部: https://t.me/{context.bot.username}?start=joinall_{added_by.id}",
                     parse_mode="Markdown"
                 )
                 logger.info(f"Notification sent to admin {added_by.id}")
@@ -873,7 +981,7 @@ async def bind_group_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if save_group(group_id, group_title, user.id):
         await update.message.reply_text(
             f"✅ 已手动绑定群组：{group_title}\n"
-            f"分享链接：https://t.me/{context.bot.username}?start=join"
+            f"分享链接：https://t.me/{context.bot.username}?start=join_{user.id}"
         )
     else:
         await update.message.reply_text("❌ 绑定失败")
@@ -906,7 +1014,7 @@ async def list_groups_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("你没有权限")
         return
     
-    groups = get_groups()
+    groups = get_groups(user.id)
     
     if not groups:
         await update.message.reply_text("暂无绑定的群组")
@@ -931,6 +1039,11 @@ async def remove_group_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     group_id = context.args[0]
+    # 验证该群组确实属于调用管理员
+    groups = get_groups(user.id)
+    if str(group_id) not in groups:
+        await update.message.reply_text("未找到该群组，或你无权移除它")
+        return
     if remove_group(group_id):
         await update.message.reply_text(f"已移除群组: {group_id}")
     else:
@@ -957,6 +1070,7 @@ async def main():
     """主函数"""
     if redis_client:
         init_admin_from_env()
+        migrate_global_groups()
         logger.info(f"Loaded admins: {get_admin_ids_from_env()}")
         logger.info(f"Invite expire: {INVITE_EXPIRE_MINUTES}min, Cooldown: {INVITE_COOLDOWN_HOURS}h")
     
