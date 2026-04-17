@@ -427,25 +427,40 @@ async def handle_join_all(update: Update, context: ContextTypes.DEFAULT_TYPE, us
         await send_single_invite(update, context, user, gid, title)
         return
     
-    # 多个可用，显示确认按钮
-    text = f"📋 发现 {len(available_groups)} 个可加入的群组：\n\n"
-    for i, (gid, title) in enumerate(available_groups, 1):
-        text += f"{i}. {title}\n"
+    # 多个可用，直接生成所有邀请链接，无需确认
+    processing_msg = await update.message.reply_text("⏳ 正在生成邀请链接，请稍候...")
     
+    keyboard_buttons = []
+    failed_groups = []
+    success_count = 0
+    
+    for gid, title in available_groups:
+        try:
+            expire_time = int((datetime.now() + timedelta(minutes=INVITE_EXPIRE_MINUTES)).timestamp())
+            invite_link = await context.bot.create_chat_invite_link(
+                chat_id=int(gid),
+                member_limit=1,
+                expire_date=expire_time
+            )
+            log_invite(user.id, gid, invite_link.invite_link, title)
+            record_user_invite(user.id, gid)
+            keyboard_buttons.append([InlineKeyboardButton(f"👉 加入 {title}", url=invite_link.invite_link)])
+            success_count += 1
+        except Exception as e:
+            logger.error(f"Failed to create invite for {gid}: {e}")
+            failed_groups.append(title)
+    
+    text = f"✅ 已生成 {success_count} 个邀请链接\n"
     if cooling_groups:
-        text += f"\n⏳ {len(cooling_groups)} 个群组冷却中\n"
+        text += f"⏳ {len(cooling_groups)} 个群组冷却中\n"
+    if failed_groups:
+        text += f"❌ {len(failed_groups)} 个群组生成失败\n"
+    text += f"\n⏰ 链接将在 {INVITE_EXPIRE_MINUTES} 分钟后过期\n"
+    text += "🔒 每个链接仅限使用一次"
     
-    text += f"\n⏰ 邀请链接 {INVITE_EXPIRE_MINUTES} 分钟后过期\n"
-    text += f"🎫 每群组每 {INVITE_COOLDOWN_HOURS} 小时限领一次"
-    
-    keyboard = [[InlineKeyboardButton(
-        "🚀 一键加入所有群组", 
-        callback_data=f"joinall_{user.id}"
-    )]]
-    
-    await update.message.reply_text(
+    await processing_msg.edit_text(
         text,
-        reply_markup=InlineKeyboardMarkup(keyboard)
+        reply_markup=InlineKeyboardMarkup(keyboard_buttons) if keyboard_buttons else None
     )
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -523,17 +538,30 @@ async def select_group_callback(update: Update, context: ContextTypes.DEFAULT_TY
     
     group_title = groups[group_id]['title']
     
-    keyboard = [[InlineKeyboardButton(
-        f"🚀 加入 {group_title}", 
-        callback_data=f"join_{group_id}_{user_id}"
-    )]]
-    
-    await query.edit_message_text(
-        f"👋 欢迎加入 {group_title}！\n\n"
-        f"⏰ 邀请链接将在 {INVITE_EXPIRE_MINUTES} 分钟后过期\n"
-        f"🎫 每人每 {INVITE_COOLDOWN_HOURS} 小时限领一次",
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
+    # 直接生成邀请链接，无需二次确认
+    try:
+        expire_time = int((datetime.now() + timedelta(minutes=INVITE_EXPIRE_MINUTES)).timestamp())
+        invite_link = await context.bot.create_chat_invite_link(
+            chat_id=int(group_id),
+            member_limit=1,
+            expire_date=expire_time
+        )
+        
+        log_invite(user_id, group_id, invite_link.invite_link, group_title)
+        record_user_invite(user_id, group_id)
+        
+        keyboard = [[InlineKeyboardButton(f"👉 点击加入 {group_title}", url=invite_link.invite_link)]]
+        await query.edit_message_text(
+            f"✅ {group_title}\n\n"
+            f"⏰ 链接将在 {INVITE_EXPIRE_MINUTES} 分钟后过期\n"
+            f"🔒 仅限你使用一次",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        logger.info(f"User {user_id} got invite link for group {group_id}")
+        
+    except Exception as e:
+        logger.error(f"Failed to create invite: {e}")
+        await query.edit_message_text(f"❌ {group_title} 邀请生成失败，请联系管理员")
 
 async def join_all_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """处理一键加入所有群组的回调"""
