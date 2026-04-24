@@ -261,7 +261,6 @@ def log_invite(user_id, group_id, invite_link, group_title, admin_id=None):
         "invite_link": invite_link,
         "admin_id": admin_id,
         "created_at": datetime.now().isoformat(),
-        "expire_at": (datetime.now() + timedelta(minutes=INVITE_EXPIRE_MINUTES)).isoformat(),
         "revoked": False
     }
     redis_client.lpush(INVITE_LOG_KEY, json.dumps(log_entry))
@@ -288,7 +287,7 @@ def format_user_info(user_id, first_name="", last_name="", username=None):
 # ============ 自动清理功能 ============
 
 async def cleanup_expired_invites():
-    """清理 Redis 中的过期邀请记录"""
+    """清理 Redis 中的过期邀请记录（删除7天前的日志）"""
     if not redis_client:
         return 0
     
@@ -298,81 +297,20 @@ async def cleanup_expired_invites():
     for log in logs:
         try:
             entry = json.loads(log)
-            expire_at = datetime.fromisoformat(entry['expire_at'])
-            
-            # 过期超过1小时的记录删除
-            if datetime.now() - expire_at > timedelta(hours=1):
+            created_at = datetime.fromisoformat(entry['created_at'])
+            if datetime.now() - created_at > timedelta(days=7):
                 redis_client.lrem(INVITE_LOG_KEY, 0, log)
                 removed += 1
         except:
             continue
     
     if removed > 0:
-        logger.info(f"Cleanup: removed {removed} expired invite logs from Redis")
+        logger.info(f"Cleanup: removed {removed} old invite logs from Redis")
     return removed
 
 async def revoke_expired_invites(application: Application):
-    """撤销 Telegram 群组中已失效的邀请链接"""
-    if not redis_client:
-        return 0
-    
-    logs = redis_client.lrange(INVITE_LOG_KEY, 0, -1)
-    revoked_count = 0
-    failed_count = 0
-    
-    for log in logs:
-        try:
-            entry = json.loads(log)
-            
-            # 检查是否已撤销
-            if entry.get('revoked', False):
-                continue
-            
-            # 检查是否过期
-            expire_at = datetime.fromisoformat(entry['expire_at'])
-            if datetime.now() < expire_at:
-                continue  # 未过期，跳过
-            
-            group_id = entry.get('group_id')
-            invite_link = entry.get('invite_link', '')
-            
-            if not group_id or not invite_link:
-                continue
-            
-            try:
-                await application.bot.revoke_chat_invite_link(
-                    chat_id=int(group_id),
-                    invite_link=invite_link
-                )
-                
-                # 标记为已撤销
-                entry['revoked'] = True
-                entry['revoked_at'] = datetime.now().isoformat()
-                redis_client.lrem(INVITE_LOG_KEY, 0, log)
-                redis_client.lpush(INVITE_LOG_KEY, json.dumps(entry))
-                
-                revoked_count += 1
-                logger.info(f"Revoked expired invite: {invite_link}")
-                
-            except Exception as e:
-                failed_count += 1
-                logger.error(f"Failed to revoke invite {invite_link}: {e}")
-                
-                # 如果撤销失败（可能链接已失效或已被删除），标记为已处理
-                if "INVITE_HASH_EXPIRED" in str(e) or "INVITE_HASH_INVALID" in str(e):
-                    entry['revoked'] = True
-                    entry['revoke_failed'] = True
-                    entry['revoke_error'] = str(e)
-                    redis_client.lrem(INVITE_LOG_KEY, 0, log)
-                    redis_client.lpush(INVITE_LOG_KEY, json.dumps(entry))
-                
-        except Exception as e:
-            logger.error(f"Error processing log entry: {e}")
-            continue
-    
-    if revoked_count > 0 or failed_count > 0:
-        logger.info(f"Revoke completed: {revoked_count} revoked, {failed_count} failed")
-    return revoked_count
+    """邀请链接仅限次数，无时效，无需自动撤销"""
+    return 0
 
 async def cleanup_expired_cooldowns():
     """检查即将过期的冷却"""
@@ -417,7 +355,7 @@ async def cleanup_expired_data(application: Application):
                         entry = json.loads(log)
                         if entry.get('revoked', False):
                             revoked_total += 1
-                        elif datetime.fromisoformat(entry['expire_at']) > datetime.now():
+                        elif datetime.now() - datetime.fromisoformat(entry['created_at']) < timedelta(days=1):
                             active += 1
                         else:
                             expired += 1
@@ -483,11 +421,9 @@ async def send_single_invite(update, context, user, group_id, group_title, admin
         return False
     
     try:
-        expire_time = int((datetime.now() + timedelta(minutes=INVITE_EXPIRE_MINUTES)).timestamp())
         invite_link = await context.bot.create_chat_invite_link(
             chat_id=int(group_id),
-            member_limit=1,
-            expire_date=expire_time
+            member_limit=1
         )
         
         log_invite(user.id, group_id, invite_link.invite_link, group_title, admin_id)
@@ -495,7 +431,7 @@ async def send_single_invite(update, context, user, group_id, group_title, admin
         
         keyboard = [[InlineKeyboardButton(f"👉 加入 {group_title}", url=invite_link.invite_link)]]
         await update.message.reply_text(
-            f"✅ {group_title}\n⏰ {INVITE_EXPIRE_MINUTES}分钟后过期",
+            f"✅ 已为你生成「{group_title}」的专属邀请链接\n🔒 仅限使用一次",
             reply_markup=InlineKeyboardMarkup(keyboard)
         )
         return True
@@ -504,6 +440,26 @@ async def send_single_invite(update, context, user, group_id, group_title, admin
         logger.error(f"Failed to create invite: {e}")
         await update.message.reply_text(f"❌ {group_title} 邀请生成失败")
         return False
+
+def build_group_selection_keyboard(user_id, admin_id, groups):
+    """构建群组选择键盘和提示文本"""
+    keyboard = []
+    for gid, info in groups.items():
+        can_get, ttl = can_user_get_invite(user_id, gid)
+        if not can_get:
+            label = f"✅ {info['title']} (已领取)"
+        elif info.get('approval_required', False):
+            label = f"🔒 {info['title']} (需审批)"
+        else:
+            label = f"👥 {info['title']}"
+        keyboard.append([InlineKeyboardButton(label, callback_data=f"select_{gid}_{user_id}_{admin_id}")])
+
+    keyboard.append([InlineKeyboardButton(
+        "🚀 一键加入所有群组",
+        callback_data=f"joinall_{user_id}_{admin_id}"
+    )])
+    text = WELCOME_TEXT + f"\n\n🔒 每群组每{INVITE_COOLDOWN_HOURS}小时限领一次\n✅ = 已领取"
+    return keyboard, text
 
 async def handle_join_flow(update: Update, context: ContextTypes.DEFAULT_TYPE, user, admin_id):
     """处理用户加入流程（选择单个群组）"""
@@ -521,32 +477,8 @@ async def handle_join_flow(update: Update, context: ContextTypes.DEFAULT_TYPE, u
         return
     
     # 多个群组，显示选择菜单
-    keyboard = []
-    for gid, info in groups.items():
-        can_get, ttl = can_user_get_invite(user.id, gid)
-        if not can_get:
-            status = " (冷却中)"
-        elif info.get('approval_required', False):
-            status = " (需审批)"
-        else:
-            status = ""
-        
-        keyboard.append([InlineKeyboardButton(
-            f"{info['title']}{status}", 
-            callback_data=f"select_{gid}_{user.id}_{admin_id}"
-        )])
-    
-    # 添加"加入全部"选项
-    keyboard.append([InlineKeyboardButton(
-        "🚀 一键加入所有群组", 
-        callback_data=f"joinall_{user.id}_{admin_id}"
-    )])
-    
-    await update.message.reply_text(
-        WELCOME_TEXT + f"\n\n⏰ 邀请链接有效期：{INVITE_EXPIRE_MINUTES}分钟\n"
-        f"🕐 每群组每{INVITE_COOLDOWN_HOURS}小时限领一次",
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
+    keyboard, text = build_group_selection_keyboard(user.id, admin_id, groups)
+    await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def handle_join_all(update: Update, context: ContextTypes.DEFAULT_TYPE, user, admin_id):
     """处理批量加入所有群组"""
@@ -624,11 +556,9 @@ async def handle_join_all(update: Update, context: ContextTypes.DEFAULT_TYPE, us
                     failed_groups.append(title)
         else:
             try:
-                expire_time = int((datetime.now() + timedelta(minutes=INVITE_EXPIRE_MINUTES)).timestamp())
                 invite_link = await context.bot.create_chat_invite_link(
                     chat_id=int(gid),
-                    member_limit=1,
-                    expire_date=expire_time
+                    member_limit=1
                 )
                 log_invite(user.id, gid, invite_link.invite_link, title, admin_id)
                 record_user_invite(user.id, gid)
@@ -648,8 +578,7 @@ async def handle_join_all(update: Update, context: ContextTypes.DEFAULT_TYPE, us
     if failed_groups:
         text += f"❌ {len(failed_groups)} 个群组处理失败\n"
     if success_count:
-        text += f"\n⏰ 链接将在 {INVITE_EXPIRE_MINUTES} 分钟后过期\n"
-        text += "🔒 每个链接仅限使用一次"
+        text += "\n🔒 每个链接仅限使用一次"
     
     await processing_msg.edit_text(
         text or "处理完成",
@@ -684,8 +613,7 @@ def build_admin_main_text(user_id):
     return (
         f"🤖 管理员面板\n\n"
         f"已绑定群组: {len(groups)} 个\n"
-        f"邀请有效期: {INVITE_EXPIRE_MINUTES}分钟\n"
-        f"邀请冷却: {INVITE_COOLDOWN_HOURS}小时"
+        f"邀请冷却: {INVITE_COOLDOWN_HOURS}小时/群组"
     )
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -762,9 +690,11 @@ async def select_group_callback(update: Update, context: ContextTypes.DEFAULT_TY
     can_get, ttl = can_user_get_invite(user_id, group_id)
     if not can_get:
         time_left = format_time_left(ttl)
+        back_btn = [[InlineKeyboardButton("⬅️ 选择其他群组", callback_data=f"backselect_{user_id}_{admin_id}")]]
         await query.edit_message_text(
-            f"⏳ 你已经在 {INVITE_COOLDOWN_HOURS} 小时内获取过该群组的邀请链接\n"
-            f"请等待 {time_left} 后再试"
+            f"✅ 你已领取过「{group_title}」的邀请链接\n"
+            f"冷却剩余：{time_left}",
+            reply_markup=InlineKeyboardMarkup(back_btn)
         )
         return
     
@@ -774,7 +704,11 @@ async def select_group_callback(update: Update, context: ContextTypes.DEFAULT_TY
     if groups[group_id].get('approval_required', False):
         existing = get_pending_request(user_id, group_id)
         if existing:
-            await query.edit_message_text(f"⏳ 你已提交过「{group_title}」的申请，请等待管理员审核")
+            back_btn = [[InlineKeyboardButton("⬅️ 选择其他群组", callback_data=f"backselect_{user_id}_{admin_id}")]]
+            await query.edit_message_text(
+                f"⏳ 你已提交过「{group_title}」的申请，请等待管理员审核",
+                reply_markup=InlineKeyboardMarkup(back_btn)
+            )
             return
         user_info = {"username": query.from_user.username, "first_name": query.from_user.first_name or ""}
         save_pending_request(user_id, group_id, user_info, group_title, admin_id)
@@ -790,7 +724,11 @@ async def select_group_callback(update: Update, context: ContextTypes.DEFAULT_TY
                 reply_markup=InlineKeyboardMarkup(notify_keyboard),
                 parse_mode="HTML"
             )
-            await query.edit_message_text(f"📤 已提交加入「{group_title}」的申请，请等待管理员审核")
+            back_btn = [[InlineKeyboardButton("⬅️ 选择其他群组", callback_data=f"backselect_{user_id}_{admin_id}")]]
+            await query.edit_message_text(
+                f"📤 已提交加入「{group_title}」的申请，请等待管理员审核",
+                reply_markup=InlineKeyboardMarkup(back_btn)
+            )
         except Exception as e:
             logger.error(f"Failed to notify admin {admin_id}: {e}")
             delete_pending_request(user_id, group_id)
@@ -799,21 +737,20 @@ async def select_group_callback(update: Update, context: ContextTypes.DEFAULT_TY
     
     # 直接生成邀请链接，无需二次确认
     try:
-        expire_time = int((datetime.now() + timedelta(minutes=INVITE_EXPIRE_MINUTES)).timestamp())
         invite_link = await context.bot.create_chat_invite_link(
             chat_id=int(group_id),
-            member_limit=1,
-            expire_date=expire_time
+            member_limit=1
         )
         
         log_invite(user_id, group_id, invite_link.invite_link, group_title, admin_id)
         record_user_invite(user_id, group_id)
         
-        keyboard = [[InlineKeyboardButton(f"👉 点击加入 {group_title}", url=invite_link.invite_link)]]
+        keyboard = [
+            [InlineKeyboardButton(f"👉 点击加入 {group_title}", url=invite_link.invite_link)],
+            [InlineKeyboardButton("⬅️ 选择其他群组", callback_data=f"backselect_{user_id}_{admin_id}")]
+        ]
         await query.edit_message_text(
-            f"✅ {group_title}\n\n"
-            f"⏰ 链接将在 {INVITE_EXPIRE_MINUTES} 分钟后过期\n"
-            f"🔒 仅限你使用一次",
+            f"✅ 已为你生成「{group_title}」的专属邀请链接\n🔒 仅限使用一次",
             reply_markup=InlineKeyboardMarkup(keyboard)
         )
         logger.info(f"User {user_id} got invite link for group {group_id}")
@@ -882,11 +819,9 @@ async def join_all_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         try:
             # 生成邀请
-            expire_time = int((datetime.now() + timedelta(minutes=INVITE_EXPIRE_MINUTES)).timestamp())
             invite_link = await context.bot.create_chat_invite_link(
                 chat_id=int(gid),
-                member_limit=1,
-                expire_date=expire_time
+                member_limit=1
             )
             
             # 记录
@@ -904,14 +839,39 @@ async def join_all_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = f"📋 处理结果（邀请 {success_count}/{len(groups)}）：\n\n"
     text += "\n".join(results)
     if success_count:
-        text += f"\n\n⏰ 邀请链接 {INVITE_EXPIRE_MINUTES} 分钟后过期\n"
-        text += "🔒 每个链接仅限使用一次"
+        text += "\n\n🔒 每个链接仅限使用一次"
     
     await query.edit_message_text(
         text,
         parse_mode="Markdown",
         disable_web_page_preview=True
     )
+
+async def backselect_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """返回群组选择菜单"""
+    query = update.callback_query
+    await query.answer()
+
+    data = query.data.split("_")
+    # format: backselect_{user_id}_{admin_id}
+    if len(data) < 3:
+        await query.edit_message_text("链接已失效，请重新获取")
+        return
+
+    user_id = int(data[1])
+    admin_id = int(data[2])
+
+    if query.from_user.id != user_id:
+        await query.answer("这不是你的操作", show_alert=True)
+        return
+
+    groups = get_groups(admin_id)
+    if not groups:
+        await query.edit_message_text("机器人尚未配置群组，请联系管理员")
+        return
+
+    keyboard, text = build_group_selection_keyboard(user_id, admin_id, groups)
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """处理加入按钮"""
@@ -932,19 +892,14 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not can_get:
         time_left = format_time_left(ttl)
         await query.edit_message_text(
-            f"⏳ 你已经在 {INVITE_COOLDOWN_HOURS} 小时内获取过该群组的邀请链接\n"
-            f"请等待 {time_left} 后再试"
+            f"✅ 你已领取过该群组的邀请链接\n冷却剩余：{time_left}"
         )
         return
     
     try:
-        # 计算过期时间
-        expire_time = int((datetime.now() + timedelta(minutes=INVITE_EXPIRE_MINUTES)).timestamp())
-        
         invite_link = await context.bot.create_chat_invite_link(
             chat_id=int(group_id),
-            member_limit=1,
-            expire_date=expire_time
+            member_limit=1
         )
         
         # 记录邀请
@@ -957,14 +912,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         keyboard = [[InlineKeyboardButton("👉 点击加入群组", url=invite_link.invite_link)]]
         await query.edit_message_text(
-            f"✅ 验证通过！\n\n"
-            f"⏰ 链接将在 {INVITE_EXPIRE_MINUTES} 分钟后过期\n"
-            f"🔒 仅限你使用一次\n\n"
-            f"点击下方链接加入：",
+            f"✅ 已为你生成专属邀请链接\n🔒 仅限使用一次",
             reply_markup=InlineKeyboardMarkup(keyboard)
         )
         
-        logger.info(f"User {user_id} got invite link for group {group_id}, expires in {INVITE_EXPIRE_MINUTES}min")
+        logger.info(f"User {user_id} got invite link for group {group_id}")
         
     except Exception as e:
         logger.error(f"Failed to create invite link: {e}")
@@ -1207,8 +1159,7 @@ async def admin_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
             f"独立用户: {unique_users}\n"
             f"已撤销链接: {revoked_count}\n\n"
             f"配置:\n"
-            f"邀请有效期: {INVITE_EXPIRE_MINUTES}分钟\n"
-            f"邀请冷却: {INVITE_COOLDOWN_HOURS}小时"
+            f"邀请冷却: {INVITE_COOLDOWN_HOURS}小时/群组"
         )
         await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(back_btn))
         return
@@ -1234,8 +1185,7 @@ async def admin_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
             f"🧪 测试报告\n\n"
             f"Redis 状态: {redis_status}\n"
             f"已绑定群组: {len(groups)} 个\n"
-            f"邀请有效期: {INVITE_EXPIRE_MINUTES}分钟\n"
-            f"邀请冷却: {INVITE_COOLDOWN_HOURS}小时\n"
+            f"邀请冷却: {INVITE_COOLDOWN_HOURS}小时/群组\n"
             f"当前用户ID: {user.id}\n"
             f"是否为管理员: 是"
         )
@@ -1255,7 +1205,7 @@ async def admin_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
                     entry = json.loads(log)
                     if entry.get('revoked', False):
                         revoked += 1
-                    elif datetime.fromisoformat(entry['expire_at']) > datetime.now():
+                    elif datetime.now() - datetime.fromisoformat(entry['created_at']) < timedelta(days=1):
                         valid += 1
                     else:
                         expired += 1
@@ -1264,8 +1214,8 @@ async def admin_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
             text = (
                 f"✅ 清理完成\n\n"
                 f"🗑️ 已删除记录: {removed}\n"
-                f"✨ 有效邀请: {valid}\n"
-                f"⏰ 待撤销: {expired}\n"
+                f"✨ 近24小时邀请: {valid}\n"
+                f"📅 超24小时记录: {expired}\n"
                 f"🚫 已撤销: {revoked}\n"
                 f"📊 总计: {len(logs)}"
             )
@@ -1430,7 +1380,7 @@ async def cleanup_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 entry = json.loads(log)
                 if entry.get('revoked', False):
                     revoked += 1
-                elif datetime.fromisoformat(entry['expire_at']) > datetime.now():
+                elif datetime.now() - datetime.fromisoformat(entry['created_at']) < timedelta(days=1):
                     valid += 1
                 else:
                     expired += 1
@@ -1440,8 +1390,8 @@ async def cleanup_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text = (
             f"✅ 清理完成\n\n"
             f"🗑️ 已删除记录: {removed}\n"
-            f"✨ 有效邀请: {valid}\n"
-            f"⏰ 待撤销: {expired}\n"
+            f"✨ 近24小时邀请: {valid}\n"
+            f"📅 超24小时记录: {expired}\n"
             f"🚫 已撤销: {revoked}\n"
             f"📊 总计: {len(logs)}"
         )
@@ -1507,8 +1457,7 @@ async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"独立用户: {unique_users}\n"
         f"已撤销链接: {revoked_count}\n\n"
         f"配置:\n"
-        f"邀请有效期: {INVITE_EXPIRE_MINUTES}分钟\n"
-        f"邀请冷却: {INVITE_COOLDOWN_HOURS}小时"
+        f"邀请冷却: {INVITE_COOLDOWN_HOURS}小时/群组"
     )
     
     await update.message.reply_text(text)
@@ -1523,14 +1472,12 @@ async def test_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     redis_status = "连接正常" if redis_client and redis_client.ping() else "连接失败"
     groups = get_groups(user.id)
-    admin_ids = get_admin_ids_from_env()
     
     text = (
         f"🧪 测试报告\n\n"
         f"Redis 状态: {redis_status}\n"
         f"已绑定群组: {len(groups)} 个\n"
-        f"邀请有效期: {INVITE_EXPIRE_MINUTES}分钟\n"
-        f"邀请冷却: {INVITE_COOLDOWN_HOURS}小时\n"
+        f"邀请冷却: {INVITE_COOLDOWN_HOURS}小时/群组\n"
         f"当前用户ID: {user.id}\n"
         f"是否为管理员: {is_admin(user.id)}"
     )
@@ -1736,7 +1683,7 @@ async def main():
         init_admin_from_env()
         migrate_global_groups()
         logger.info(f"Loaded admins: {get_admin_ids_from_env()}")
-        logger.info(f"Invite expire: {INVITE_EXPIRE_MINUTES}min, Cooldown: {INVITE_COOLDOWN_HOURS}h")
+        logger.info(f"Cooldown: {INVITE_COOLDOWN_HOURS}h, invite links: count-limited only")
     
     application = Application.builder().token(BOT_TOKEN).build()
     
@@ -1761,6 +1708,7 @@ async def main():
     application.add_handler(CallbackQueryHandler(approve_request_callback, pattern="^approve_"))
     application.add_handler(CallbackQueryHandler(reject_request_callback, pattern="^reject_"))
     application.add_handler(CallbackQueryHandler(select_group_callback, pattern="^select_"))
+    application.add_handler(CallbackQueryHandler(backselect_callback, pattern="^backselect_"))
     application.add_handler(CallbackQueryHandler(join_all_callback, pattern="^joinall_"))
     application.add_handler(CallbackQueryHandler(button_handler, pattern="^join_"))
     
