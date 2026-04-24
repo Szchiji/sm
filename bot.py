@@ -454,10 +454,6 @@ def build_group_selection_keyboard(user_id, admin_id, groups):
             label = f"👥 {info['title']}"
         keyboard.append([InlineKeyboardButton(label, callback_data=f"select_{gid}_{user_id}_{admin_id}")])
 
-    keyboard.append([InlineKeyboardButton(
-        "🚀 一键加入所有群组",
-        callback_data=f"joinall_{user_id}_{admin_id}"
-    )])
     text = WELCOME_TEXT + f"\n\n🔒 每群组每{INVITE_COOLDOWN_HOURS}小时限领一次\n✅ = 已领取"
     return keyboard, text
 
@@ -745,12 +741,15 @@ async def select_group_callback(update: Update, context: ContextTypes.DEFAULT_TY
         log_invite(user_id, group_id, invite_link.invite_link, group_title, admin_id)
         record_user_invite(user_id, group_id)
         
+        # 重新构建群组选择菜单（已加入的群组自动显示 ✅），并将邀请按钮置顶
+        groups_updated = get_groups(admin_id)
+        sel_keyboard, sel_text = build_group_selection_keyboard(user_id, admin_id, groups_updated)
         keyboard = [
             [InlineKeyboardButton(f"👉 点击加入 {group_title}", url=invite_link.invite_link)],
-            [InlineKeyboardButton("⬅️ 选择其他群组", callback_data=f"backselect_{user_id}_{admin_id}")]
+            *sel_keyboard
         ]
         await query.edit_message_text(
-            f"✅ 已为你生成「{group_title}」的专属邀请链接\n🔒 仅限使用一次",
+            f"✅ 已为你生成「{group_title}」的专属邀请链接，🔒 仅限使用一次\n\n{sel_text}",
             reply_markup=InlineKeyboardMarkup(keyboard)
         )
         logger.info(f"User {user_id} got invite link for group {group_id}")
