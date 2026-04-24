@@ -716,7 +716,7 @@ async def select_group_callback(update: Update, context: ContextTypes.DEFAULT_TY
             # 申请已提交，返回第一个界面并显示提交确认
             keyboard, text = build_group_selection_keyboard(user_id, admin_id, groups)
             await query.edit_message_text(
-                f"📤 已提交加入「{group_title}」的申请，请等待管理员审核\n\n{text}",
+                f"📤 已提交加入「{group_title}」的申请，请等待管理员审核\n\n──────────────\n{text}",
                 reply_markup=InlineKeyboardMarkup(keyboard)
             )
         except Exception as e:
@@ -743,7 +743,7 @@ async def select_group_callback(update: Update, context: ContextTypes.DEFAULT_TY
             *sel_keyboard
         ]
         await query.edit_message_text(
-            sel_text,
+            f"✅ 「{group_title}」邀请链接已生成，🔒 仅限使用一次\n\n{sel_text}",
             reply_markup=InlineKeyboardMarkup(keyboard)
         )
         logger.info(f"User {user_id} got invite link for group {group_id}")
