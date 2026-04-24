@@ -472,8 +472,42 @@ async def handle_join_flow(update: Update, context: ContextTypes.DEFAULT_TYPE, u
         await send_single_invite(update, context, user, group_id, list(groups.values())[0]['title'], admin_id)
         return
     
-    # 多个群组，显示选择菜单
-    keyboard, text = build_group_selection_keyboard(user.id, admin_id, groups)
+    # 多个群组：直接为可用群组生成邀请链接，已领取/审批群组保留回调按钮
+    keyboard = []
+    has_invite = False
+    for gid, info in groups.items():
+        title = info['title']
+        can_get, ttl = can_user_get_invite(user.id, gid)
+        if not can_get:
+            keyboard.append([InlineKeyboardButton(
+                f"✅ {title} (冷却 {format_time_left(ttl)})",
+                callback_data=f"select_{gid}_{user.id}_{admin_id}"
+            )])
+        elif info.get('approval_required', False):
+            keyboard.append([InlineKeyboardButton(
+                f"🔒 {title} (申请加入)",
+                callback_data=f"select_{gid}_{user.id}_{admin_id}"
+            )])
+        else:
+            try:
+                invite_link = await context.bot.create_chat_invite_link(
+                    chat_id=int(gid),
+                    member_limit=1
+                )
+                log_invite(user.id, gid, invite_link.invite_link, title, admin_id)
+                record_user_invite(user.id, gid)
+                keyboard.append([InlineKeyboardButton(f"👉 加入 {title}", url=invite_link.invite_link)])
+                has_invite = True
+            except Exception as e:
+                logger.error(f"Failed to create invite for {gid}: {e}")
+                keyboard.append([InlineKeyboardButton(
+                    f"❌ {title} (生成失败，点击重试)",
+                    callback_data=f"select_{gid}_{user.id}_{admin_id}"
+                )])
+    text = WELCOME_TEXT
+    if has_invite:
+        text += "\n\n🔒 每个链接仅限使用一次"
+    text += f"\n\n🕐 每群组每{INVITE_COOLDOWN_HOURS}小时限领一次 | ✅ = 已领取"
     await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def handle_join_all(update: Update, context: ContextTypes.DEFAULT_TYPE, user, admin_id):
