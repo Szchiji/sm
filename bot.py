@@ -681,30 +681,23 @@ async def select_group_callback(update: Update, context: ContextTypes.DEFAULT_TY
     if group_id not in groups:
         await query.edit_message_text("该群组已不可用")
         return
-    
-    # 检查冷却时间
+
+    group_title = groups[group_id]['title']
+
+    # 检查冷却时间 - 直接返回第一个界面，无需额外点击
     can_get, ttl = can_user_get_invite(user_id, group_id)
     if not can_get:
-        time_left = format_time_left(ttl)
-        back_btn = [[InlineKeyboardButton("⬅️ 选择其他群组", callback_data=f"backselect_{user_id}_{admin_id}")]]
-        await query.edit_message_text(
-            f"✅ 你已领取过「{group_title}」的邀请链接\n"
-            f"冷却剩余：{time_left}",
-            reply_markup=InlineKeyboardMarkup(back_btn)
-        )
+        keyboard, text = build_group_selection_keyboard(user_id, admin_id, groups)
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
         return
-    
-    group_title = groups[group_id]['title']
-    
+
     # 检查是否需要审批
     if groups[group_id].get('approval_required', False):
         existing = get_pending_request(user_id, group_id)
         if existing:
-            back_btn = [[InlineKeyboardButton("⬅️ 选择其他群组", callback_data=f"backselect_{user_id}_{admin_id}")]]
-            await query.edit_message_text(
-                f"⏳ 你已提交过「{group_title}」的申请，请等待管理员审核",
-                reply_markup=InlineKeyboardMarkup(back_btn)
-            )
+            # 已提交过申请，直接返回第一个界面
+            keyboard, text = build_group_selection_keyboard(user_id, admin_id, groups)
+            await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
             return
         user_info = {"username": query.from_user.username, "first_name": query.from_user.first_name or ""}
         save_pending_request(user_id, group_id, user_info, group_title, admin_id)
@@ -720,28 +713,29 @@ async def select_group_callback(update: Update, context: ContextTypes.DEFAULT_TY
                 reply_markup=InlineKeyboardMarkup(notify_keyboard),
                 parse_mode="HTML"
             )
-            back_btn = [[InlineKeyboardButton("⬅️ 选择其他群组", callback_data=f"backselect_{user_id}_{admin_id}")]]
+            # 申请已提交，返回第一个界面并显示提交确认
+            keyboard, text = build_group_selection_keyboard(user_id, admin_id, groups)
             await query.edit_message_text(
-                f"📤 已提交加入「{group_title}」的申请，请等待管理员审核",
-                reply_markup=InlineKeyboardMarkup(back_btn)
+                f"📤 已提交加入「{group_title}」的申请，请等待管理员审核\n\n{text}",
+                reply_markup=InlineKeyboardMarkup(keyboard)
             )
         except Exception as e:
             logger.error(f"Failed to notify admin {admin_id}: {e}")
             delete_pending_request(user_id, group_id)
             await query.edit_message_text(f"❌ {group_title} 申请提交失败，请联系管理员")
         return
-    
+
     # 直接生成邀请链接，无需二次确认
     try:
         invite_link = await context.bot.create_chat_invite_link(
             chat_id=int(group_id),
             member_limit=1
         )
-        
+
         log_invite(user_id, group_id, invite_link.invite_link, group_title, admin_id)
         record_user_invite(user_id, group_id)
-        
-        # 重新构建群组选择菜单（已加入的群组自动显示 ✅），并将邀请按钮置顶
+
+        # 生成成功后直接返回第一个界面（群组选择），邀请按钮置顶
         groups_updated = get_groups(admin_id)
         sel_keyboard, sel_text = build_group_selection_keyboard(user_id, admin_id, groups_updated)
         keyboard = [
@@ -749,7 +743,7 @@ async def select_group_callback(update: Update, context: ContextTypes.DEFAULT_TY
             *sel_keyboard
         ]
         await query.edit_message_text(
-            f"✅ 已为你生成「{group_title}」的专属邀请链接，🔒 仅限使用一次\n\n{sel_text}",
+            sel_text,
             reply_markup=InlineKeyboardMarkup(keyboard)
         )
         logger.info(f"User {user_id} got invite link for group {group_id}")
