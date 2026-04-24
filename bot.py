@@ -777,7 +777,8 @@ async def join_all_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     groups = get_groups(admin_id)
-    results = []
+    keyboard_buttons = []
+    status_lines = []
     success_count = 0
     
     # 编辑消息显示处理中
@@ -787,14 +788,14 @@ async def join_all_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # 检查冷却
         can_get, ttl = can_user_get_invite(user_id, gid)
         if not can_get:
-            results.append(f"⏳ {info['title']} - 冷却中 ({format_time_left(ttl)})")
+            status_lines.append(f"✅ {info['title']} (已领取，冷却 {format_time_left(ttl)})")
             continue
         
         # 检查是否需要审批
         if info.get('approval_required', False):
             existing = get_pending_request(user_id, gid)
             if existing:
-                results.append(f"⏳ {info['title']} - 审核中")
+                status_lines.append(f"⏳ {info['title']} - 审核中")
                 continue
             user_info = {"username": query.from_user.username, "first_name": query.from_user.first_name or ""}
             save_pending_request(user_id, gid, user_info, info['title'], admin_id)
@@ -810,11 +811,11 @@ async def join_all_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     reply_markup=InlineKeyboardMarkup(notify_keyboard),
                     parse_mode="HTML"
                 )
-                results.append(f"📤 {info['title']} - 等待审核")
+                status_lines.append(f"📤 {info['title']} - 等待审核")
             except Exception as e:
                 logger.error(f"Failed to notify admin for {gid}: {e}")
                 delete_pending_request(user_id, gid)
-                results.append(f"❌ {info['title']} - 申请提交失败")
+                status_lines.append(f"❌ {info['title']} - 申请提交失败")
             continue
         
         try:
@@ -828,23 +829,25 @@ async def join_all_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             log_invite(user_id, gid, invite_link.invite_link, info['title'], admin_id)
             record_user_invite(user_id, gid)
             
-            results.append(f"✅ [{info['title']}]({invite_link.invite_link})")
+            keyboard_buttons.append([InlineKeyboardButton(f"👉 加入 {info['title']}", url=invite_link.invite_link)])
             success_count += 1
             
         except Exception as e:
             logger.error(f"Failed to create invite for {gid}: {e}")
-            results.append(f"❌ {info['title']} - 生成失败")
+            status_lines.append(f"❌ {info['title']} - 生成失败")
     
-    # 发送结果
-    text = f"📋 处理结果（邀请 {success_count}/{len(groups)}）：\n\n"
-    text += "\n".join(results)
+    # 组装文本
+    text_parts = []
     if success_count:
-        text += "\n\n🔒 每个链接仅限使用一次"
+        text_parts.append(f"✅ 已生成 {success_count} 个邀请链接，点击下方按钮加入各群组：")
+    if status_lines:
+        text_parts.append("\n".join(status_lines))
+    if success_count:
+        text_parts.append("🔒 每个链接仅限使用一次")
     
     await query.edit_message_text(
-        text,
-        parse_mode="Markdown",
-        disable_web_page_preview=True
+        "\n\n".join(text_parts) if text_parts else "处理完成",
+        reply_markup=InlineKeyboardMarkup(keyboard_buttons) if keyboard_buttons else None
     )
 
 async def backselect_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
