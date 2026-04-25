@@ -47,6 +47,7 @@ USER_INVITE_PREFIX = "tg_bot:user_invite:"
 PENDING_REQUEST_PREFIX = "tg_bot:pending:"  # 待审批申请：key = pending:{user_id}_{group_id}
 ADMIN_STATE_PREFIX = "tg_bot:admin_state:"  # 管理员输入状态：key = admin_state:{user_id}
 ADMIN_STATE_TTL = 300  # 状态 5 分钟过期
+ACTIVE_INVITES_KEY = "tg_bot:active_invites"  # Hash: invite_link_url -> JSON 元数据
 
 def groups_key(admin_id):
     """返回指定管理员的群组 Redis key"""
@@ -254,17 +255,25 @@ def log_invite(user_id, group_id, invite_link, group_title, admin_id=None):
     """记录邀请日志"""
     if not redis_client:
         return
+    now_iso = datetime.now().isoformat()
     log_entry = {
         "user_id": user_id,
         "group_id": group_id,
         "group_title": group_title,
         "invite_link": invite_link,
         "admin_id": admin_id,
-        "created_at": datetime.now().isoformat(),
+        "created_at": now_iso,
         "revoked": False
     }
     redis_client.lpush(INVITE_LOG_KEY, json.dumps(log_entry))
     redis_client.ltrim(INVITE_LOG_KEY, 0, 999)
+    # 同时写入活跃邀请哈希，用于快速查找与撤销
+    redis_client.hset(ACTIVE_INVITES_KEY, invite_link, json.dumps({
+        "group_id": str(group_id),
+        "admin_id": admin_id,
+        "user_id": user_id,
+        "created_at": now_iso
+    }))
 
 def format_time_left(seconds):
     """格式化剩余时间"""
@@ -308,9 +317,100 @@ async def cleanup_expired_invites():
         logger.info(f"Cleanup: removed {removed} old invite logs from Redis")
     return removed
 
+async def revoke_invite_link(bot, invite_link_url: str) -> bool:
+    """撤销单个邀请链接：调用 Telegram API、从活跃哈希移除、在日志中标记已撤销"""
+    if not redis_client:
+        return False
+
+    data = redis_client.hget(ACTIVE_INVITES_KEY, invite_link_url)
+    if not data:
+        return False
+
+    meta = json.loads(data)
+    group_id = meta.get("group_id")
+
+    try:
+        await bot.revoke_chat_invite_link(chat_id=int(group_id), invite_link=invite_link_url)
+    except Exception as e:
+        logger.warning(f"Telegram revoke failed for {invite_link_url}: {e}")
+
+    # 无论 Telegram 调用是否成功，都从活跃列表中移除
+    redis_client.hdel(ACTIVE_INVITES_KEY, invite_link_url)
+
+    # 在日志列表中将对应条目标记为已撤销（使用 pipeline 保证原子性）
+    logs = redis_client.lrange(INVITE_LOG_KEY, 0, -1)
+    for raw in logs:
+        try:
+            entry = json.loads(raw)
+            if entry.get("invite_link") == invite_link_url and not entry.get("revoked"):
+                entry["revoked"] = True
+                pipe = redis_client.pipeline()
+                pipe.lrem(INVITE_LOG_KEY, 1, raw)
+                pipe.rpush(INVITE_LOG_KEY, json.dumps(entry))
+                pipe.execute()
+                break
+        except Exception:
+            continue
+
+    logger.info(f"Revoked invite link for group {group_id}: {invite_link_url}")
+    return True
+
+
 async def revoke_expired_invites(application: Application):
-    """邀请链接仅限次数，无时效，无需自动撤销"""
-    return 0
+    """撤销所有超过有效期（INVITE_EXPIRE_MINUTES）的未撤销邀请链接"""
+    if not redis_client:
+        return 0
+
+    active_invites = redis_client.hgetall(ACTIVE_INVITES_KEY)
+    revoked = 0
+
+    for invite_link_url, data_str in active_invites.items():
+        try:
+            meta = json.loads(data_str)
+            created_at_str = meta.get("created_at")
+            if not created_at_str:
+                logger.warning(f"Skipping invite with missing created_at: {invite_link_url}")
+                continue
+            created_at = datetime.fromisoformat(created_at_str)
+            if datetime.now() - created_at > timedelta(minutes=INVITE_EXPIRE_MINUTES):
+                if await revoke_invite_link(application.bot, invite_link_url):
+                    revoked += 1
+        except Exception as e:
+            logger.error(f"Error revoking invite {invite_link_url}: {e}")
+
+    if revoked > 0:
+        logger.info(f"Revoked {revoked} expired invite links")
+    return revoked
+
+
+async def user_joined_via_invite(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """用户通过邀请链接加入群组时自动撤销该链接"""
+    chat_member_update = update.chat_member
+    if not chat_member_update:
+        return
+
+    new_member = chat_member_update.new_chat_member
+    old_member = chat_member_update.old_chat_member
+
+    # 仅处理"新加入"事件
+    if not new_member or new_member.status not in ('member', 'administrator', 'restricted'):
+        return
+    if old_member and old_member.status in ('member', 'administrator', 'creator', 'restricted'):
+        return
+
+    invite_link_obj = chat_member_update.invite_link
+    if not invite_link_obj or not invite_link_obj.invite_link:
+        return
+
+    invite_link_url = invite_link_obj.invite_link
+    if not redis_client or not redis_client.hexists(ACTIVE_INVITES_KEY, invite_link_url):
+        return
+
+    logger.info(
+        f"User {new_member.user.id} joined group {update.effective_chat.id} "
+        f"via tracked invite link — revoking"
+    )
+    await revoke_invite_link(context.bot, invite_link_url)
 
 async def cleanup_expired_cooldowns():
     """检查即将过期的冷却"""
@@ -1745,6 +1845,7 @@ async def main():
     # 群组变动处理器
     application.add_handler(ChatMemberHandler(bot_added_to_group, ChatMemberHandler.MY_CHAT_MEMBER))
     application.add_handler(ChatMemberHandler(bot_removed_from_group, ChatMemberHandler.MY_CHAT_MEMBER))
+    application.add_handler(ChatMemberHandler(user_joined_via_invite, ChatMemberHandler.CHAT_MEMBER))
     
     # 启动后台清理任务（传递 application）
     cleanup_task = asyncio.create_task(cleanup_expired_data(application))
