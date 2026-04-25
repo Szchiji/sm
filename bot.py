@@ -25,7 +25,7 @@ ADMIN_USER_IDS = os.getenv("ADMIN_USER_IDS", "")
 WELCOME_TEXT = os.getenv("WELCOME_TEXT", "👋 欢迎！请选择要加入的群组：")
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 PORT = int(os.environ.get("PORT", 8080))
-INVITE_EXPIRE_MINUTES = int(os.getenv("INVITE_EXPIRE_MINUTES", "5"))
+INVITE_EXPIRE_MINUTES = int(os.getenv("INVITE_EXPIRE_MINUTES", "1440"))
 INVITE_COOLDOWN_HOURS = int(os.getenv("INVITE_COOLDOWN_HOURS", "24"))
 
 # Railway 域名检测
