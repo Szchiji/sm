@@ -717,12 +717,11 @@ async def handle_join_all(update: Update, context: ContextTypes.DEFAULT_TYPE, us
 
 # ============ 管理员面板（按钮菜单）============
 
-def build_admin_main_keyboard(admin_id=None):
+def build_admin_main_keyboard(admin_id):
     """构建管理员主菜单键盘"""
-    has_groups = bool(admin_id and get_groups(admin_id))
-    row2 = [InlineKeyboardButton("🧪 测试连接", callback_data="adm_test")]
-    if has_groups:
-        row2.insert(0, InlineKeyboardButton("🔗 分享链接", callback_data="adm_links"))
+    has_groups = bool(get_groups(admin_id))
+    share_btn = [InlineKeyboardButton("🔗 分享链接", callback_data="adm_links")] if has_groups else []
+    row2 = share_btn + [InlineKeyboardButton("🧪 测试连接", callback_data="adm_test")]
     return InlineKeyboardMarkup([
         [
             InlineKeyboardButton("📋 群组管理", callback_data="adm_groups"),
