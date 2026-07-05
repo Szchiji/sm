@@ -87,6 +87,18 @@ def init_admin_from_env():
     for admin_id in env_admins:
         redis_client.sadd(ADMINS_KEY, str(admin_id))
 
+def get_all_admin_ids():
+    """获取所有管理员ID（环境变量 + Redis）"""
+    env_admins = get_admin_ids_from_env()
+    admin_set = set(env_admins)
+    if redis_client:
+        try:
+            redis_admins = redis_client.smembers(ADMINS_KEY)
+            admin_set.update(int(uid) for uid in redis_admins if uid.strip().lstrip('-').isdigit())
+        except Exception:
+            pass
+    return list(admin_set)
+
 def get_groups(admin_id):
     """从 Redis 获取指定管理员的群组"""
     if not redis_client:
@@ -557,6 +569,67 @@ def build_group_selection_keyboard(user_id, admin_id, groups):
     text = WELCOME_TEXT + f"\n\n🔒 每群组每{INVITE_COOLDOWN_HOURS}小时限领一次\n✅ = 已领取"
     return keyboard, text
 
+async def handle_join_direct(update: Update, context: ContextTypes.DEFAULT_TYPE, user):
+    """用户直接打开机器人（无邀请参数）时，汇总所有管理员群组并生成邀请链接"""
+    all_admin_ids = get_all_admin_ids()
+
+    # 收集所有群组，记录 group_id -> (title, admin_id, group_info)
+    all_groups = {}
+    for admin_id in all_admin_ids:
+        groups = get_groups(admin_id)
+        for gid, info in groups.items():
+            if gid not in all_groups:
+                all_groups[gid] = (info['title'], admin_id, info)
+
+    if not all_groups:
+        await update.message.reply_text("机器人尚未配置群组，请联系管理员")
+        return
+
+    # 只有一个群组，直接发送邀请
+    if len(all_groups) == 1:
+        gid = list(all_groups.keys())[0]
+        title, admin_id, info = all_groups[gid]
+        await send_single_invite(update, context, user, gid, title, admin_id)
+        return
+
+    # 多个群组：直接生成邀请链接
+    keyboard = []
+    has_invite = False
+    for gid, (title, admin_id, info) in all_groups.items():
+        can_get, ttl = can_user_get_invite(user.id, gid)
+        if not can_get:
+            keyboard.append([InlineKeyboardButton(
+                f"✅ {title} (冷却 {format_time_left(ttl)})",
+                callback_data=f"select_{gid}_{user.id}_{admin_id}"
+            )])
+        elif info.get('approval_required', False):
+            keyboard.append([InlineKeyboardButton(
+                f"🔒 {title} (申请加入)",
+                callback_data=f"select_{gid}_{user.id}_{admin_id}"
+            )])
+        else:
+            try:
+                invite_link = await context.bot.create_chat_invite_link(
+                    chat_id=int(gid),
+                    member_limit=1
+                )
+                log_invite(user.id, gid, invite_link.invite_link, title, admin_id)
+                record_user_invite(user.id, gid)
+                keyboard.append([InlineKeyboardButton(f"👉 加入 {title}", url=invite_link.invite_link)])
+                has_invite = True
+            except Exception as e:
+                logger.error(f"Failed to create invite for {gid}: {e}")
+                keyboard.append([InlineKeyboardButton(
+                    f"❌ {title} (生成失败，点击重试)",
+                    callback_data=f"select_{gid}_{user.id}_{admin_id}"
+                )])
+
+    text = WELCOME_TEXT
+    if has_invite:
+        text += "\n\n🔒 每个链接仅限使用一次"
+    text += f"\n\n🕐 每群组每{INVITE_COOLDOWN_HOURS}小时限领一次 | ✅ = 已领取"
+    await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+
 async def handle_join_flow(update: Update, context: ContextTypes.DEFAULT_TYPE, user, admin_id):
     """处理用户加入流程（选择单个群组）"""
     groups = get_groups(admin_id)
@@ -717,17 +790,17 @@ async def handle_join_all(update: Update, context: ContextTypes.DEFAULT_TYPE, us
 
 # ============ 管理员面板（按钮菜单）============
 
-def build_admin_main_keyboard():
+def build_admin_main_keyboard(admin_id):
     """构建管理员主菜单键盘"""
+    has_groups = bool(get_groups(admin_id))
+    share_btn = [InlineKeyboardButton("🔗 分享链接", callback_data="adm_links")] if has_groups else []
+    row2 = share_btn + [InlineKeyboardButton("🧪 测试连接", callback_data="adm_test")]
     return InlineKeyboardMarkup([
         [
             InlineKeyboardButton("📋 群组管理", callback_data="adm_groups"),
             InlineKeyboardButton("📊 统计数据", callback_data="adm_stats"),
         ],
-        [
-            InlineKeyboardButton("🔗 分享链接", callback_data="adm_links"),
-            InlineKeyboardButton("🧪 测试连接", callback_data="adm_test"),
-        ],
+        row2,
         [
             InlineKeyboardButton("🧹 清理数据", callback_data="adm_cleanup"),
             InlineKeyboardButton("🚫 撤销链接", callback_data="adm_revoke"),
@@ -770,7 +843,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except (ValueError, IndexError):
                 await update.message.reply_text("链接无效，请联系管理员获取正确链接")
         else:
-            await update.message.reply_text("此机器人仅限授权管理员使用")
+            await handle_join_direct(update, context, user)
         return
     
     # 管理员面板
@@ -778,7 +851,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         clear_admin_state(user.id)
         await update.message.reply_text(
             build_admin_main_text(user.id),
-            reply_markup=build_admin_main_keyboard()
+            reply_markup=build_admin_main_keyboard(user.id)
         )
     elif start_param.startswith("joinall_"):
         try:
@@ -1150,7 +1223,7 @@ async def admin_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
         await query.answer()
         await query.edit_message_text(
             build_admin_main_text(user.id),
-            reply_markup=build_admin_main_keyboard()
+            reply_markup=build_admin_main_keyboard(user.id)
         )
         return
 
@@ -1412,7 +1485,7 @@ async def admin_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
         clear_admin_state(user.id)
         await update.message.reply_text(
             f"✅ 已添加管理员: {new_admin_id}",
-            reply_markup=build_admin_main_keyboard()
+            reply_markup=build_admin_main_keyboard(user.id)
         )
         return
 
@@ -1435,10 +1508,10 @@ async def admin_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
             await update.message.reply_text(
                 f"✅ 已绑定群组：{group_title}\n"
                 f"分享链接：https://t.me/{bot_username}?start=join_{user.id}",
-                reply_markup=build_admin_main_keyboard()
+                reply_markup=build_admin_main_keyboard(user.id)
             )
         else:
-            await update.message.reply_text("❌ 绑定失败", reply_markup=build_admin_main_keyboard())
+            await update.message.reply_text("❌ 绑定失败", reply_markup=build_admin_main_keyboard(user.id))
         return
 
 async def cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1449,7 +1522,7 @@ async def cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     clear_admin_state(user.id)
     await update.message.reply_text(
         build_admin_main_text(user.id),
-        reply_markup=build_admin_main_keyboard()
+        reply_markup=build_admin_main_keyboard(user.id)
     )
 
 async def set_approval_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
