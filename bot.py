@@ -87,6 +87,18 @@ def init_admin_from_env():
     for admin_id in env_admins:
         redis_client.sadd(ADMINS_KEY, str(admin_id))
 
+def get_all_admin_ids():
+    """获取所有管理员ID（环境变量 + Redis）"""
+    env_admins = get_admin_ids_from_env()
+    admin_set = set(env_admins)
+    if redis_client:
+        try:
+            redis_admins = redis_client.smembers(ADMINS_KEY)
+            admin_set.update(int(uid) for uid in redis_admins if uid.strip().lstrip('-').isdigit())
+        except Exception:
+            pass
+    return list(admin_set)
+
 def get_groups(admin_id):
     """从 Redis 获取指定管理员的群组"""
     if not redis_client:
@@ -557,6 +569,67 @@ def build_group_selection_keyboard(user_id, admin_id, groups):
     text = WELCOME_TEXT + f"\n\n🔒 每群组每{INVITE_COOLDOWN_HOURS}小时限领一次\n✅ = 已领取"
     return keyboard, text
 
+async def handle_join_direct(update: Update, context: ContextTypes.DEFAULT_TYPE, user):
+    """用户直接打开机器人（无邀请参数）时，汇总所有管理员群组并生成邀请链接"""
+    all_admin_ids = get_all_admin_ids()
+
+    # 收集所有群组，记录 group_id -> (title, admin_id, group_info)
+    all_groups = {}
+    for admin_id in all_admin_ids:
+        groups = get_groups(admin_id)
+        for gid, info in groups.items():
+            if gid not in all_groups:
+                all_groups[gid] = (info['title'], admin_id, info)
+
+    if not all_groups:
+        await update.message.reply_text("机器人尚未配置群组，请联系管理员")
+        return
+
+    # 只有一个群组，直接发送邀请
+    if len(all_groups) == 1:
+        gid = list(all_groups.keys())[0]
+        title, admin_id, info = all_groups[gid]
+        await send_single_invite(update, context, user, gid, title, admin_id)
+        return
+
+    # 多个群组：直接生成邀请链接
+    keyboard = []
+    has_invite = False
+    for gid, (title, admin_id, info) in all_groups.items():
+        can_get, ttl = can_user_get_invite(user.id, gid)
+        if not can_get:
+            keyboard.append([InlineKeyboardButton(
+                f"✅ {title} (冷却 {format_time_left(ttl)})",
+                callback_data=f"select_{gid}_{user.id}_{admin_id}"
+            )])
+        elif info.get('approval_required', False):
+            keyboard.append([InlineKeyboardButton(
+                f"🔒 {title} (申请加入)",
+                callback_data=f"select_{gid}_{user.id}_{admin_id}"
+            )])
+        else:
+            try:
+                invite_link = await context.bot.create_chat_invite_link(
+                    chat_id=int(gid),
+                    member_limit=1
+                )
+                log_invite(user.id, gid, invite_link.invite_link, title, admin_id)
+                record_user_invite(user.id, gid)
+                keyboard.append([InlineKeyboardButton(f"👉 加入 {title}", url=invite_link.invite_link)])
+                has_invite = True
+            except Exception as e:
+                logger.error(f"Failed to create invite for {gid}: {e}")
+                keyboard.append([InlineKeyboardButton(
+                    f"❌ {title} (生成失败，点击重试)",
+                    callback_data=f"select_{gid}_{user.id}_{admin_id}"
+                )])
+
+    text = WELCOME_TEXT
+    if has_invite:
+        text += "\n\n🔒 每个链接仅限使用一次"
+    text += f"\n\n🕐 每群组每{INVITE_COOLDOWN_HOURS}小时限领一次 | ✅ = 已领取"
+    await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+
 async def handle_join_flow(update: Update, context: ContextTypes.DEFAULT_TYPE, user, admin_id):
     """处理用户加入流程（选择单个群组）"""
     groups = get_groups(admin_id)
@@ -770,7 +843,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except (ValueError, IndexError):
                 await update.message.reply_text("链接无效，请联系管理员获取正确链接")
         else:
-            await update.message.reply_text("请通过管理员提供的邀请链接使用本机器人")
+            await handle_join_direct(update, context, user)
         return
     
     # 管理员面板
