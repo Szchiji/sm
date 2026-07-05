@@ -717,17 +717,18 @@ async def handle_join_all(update: Update, context: ContextTypes.DEFAULT_TYPE, us
 
 # ============ 管理员面板（按钮菜单）============
 
-def build_admin_main_keyboard():
+def build_admin_main_keyboard(admin_id=None):
     """构建管理员主菜单键盘"""
+    has_groups = bool(admin_id and get_groups(admin_id))
+    row2 = [InlineKeyboardButton("🧪 测试连接", callback_data="adm_test")]
+    if has_groups:
+        row2.insert(0, InlineKeyboardButton("🔗 分享链接", callback_data="adm_links"))
     return InlineKeyboardMarkup([
         [
             InlineKeyboardButton("📋 群组管理", callback_data="adm_groups"),
             InlineKeyboardButton("📊 统计数据", callback_data="adm_stats"),
         ],
-        [
-            InlineKeyboardButton("🔗 分享链接", callback_data="adm_links"),
-            InlineKeyboardButton("🧪 测试连接", callback_data="adm_test"),
-        ],
+        row2,
         [
             InlineKeyboardButton("🧹 清理数据", callback_data="adm_cleanup"),
             InlineKeyboardButton("🚫 撤销链接", callback_data="adm_revoke"),
@@ -770,7 +771,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except (ValueError, IndexError):
                 await update.message.reply_text("链接无效，请联系管理员获取正确链接")
         else:
-            await update.message.reply_text("此机器人仅限授权管理员使用")
+            await update.message.reply_text("请通过管理员提供的邀请链接使用本机器人")
         return
     
     # 管理员面板
@@ -778,7 +779,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         clear_admin_state(user.id)
         await update.message.reply_text(
             build_admin_main_text(user.id),
-            reply_markup=build_admin_main_keyboard()
+            reply_markup=build_admin_main_keyboard(user.id)
         )
     elif start_param.startswith("joinall_"):
         try:
@@ -1150,7 +1151,7 @@ async def admin_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
         await query.answer()
         await query.edit_message_text(
             build_admin_main_text(user.id),
-            reply_markup=build_admin_main_keyboard()
+            reply_markup=build_admin_main_keyboard(user.id)
         )
         return
 
@@ -1412,7 +1413,7 @@ async def admin_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
         clear_admin_state(user.id)
         await update.message.reply_text(
             f"✅ 已添加管理员: {new_admin_id}",
-            reply_markup=build_admin_main_keyboard()
+            reply_markup=build_admin_main_keyboard(user.id)
         )
         return
 
@@ -1435,10 +1436,10 @@ async def admin_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
             await update.message.reply_text(
                 f"✅ 已绑定群组：{group_title}\n"
                 f"分享链接：https://t.me/{bot_username}?start=join_{user.id}",
-                reply_markup=build_admin_main_keyboard()
+                reply_markup=build_admin_main_keyboard(user.id)
             )
         else:
-            await update.message.reply_text("❌ 绑定失败", reply_markup=build_admin_main_keyboard())
+            await update.message.reply_text("❌ 绑定失败", reply_markup=build_admin_main_keyboard(user.id))
         return
 
 async def cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1449,7 +1450,7 @@ async def cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     clear_admin_state(user.id)
     await update.message.reply_text(
         build_admin_main_text(user.id),
-        reply_markup=build_admin_main_keyboard()
+        reply_markup=build_admin_main_keyboard(user.id)
     )
 
 async def set_approval_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
