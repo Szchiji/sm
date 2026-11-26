@@ -1,4 +1,6 @@
 import os
+import csv
+import io
 import logging
 import redis
 import json
@@ -6,7 +8,7 @@ import asyncio
 import re
 from datetime import datetime, timedelta, timezone
 from aiohttp import web
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InputFile, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler,
     ChatMemberHandler, ContextTypes, MessageHandler, filters
@@ -2125,6 +2127,42 @@ async def set_cooldown_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("❌ 冷却时间设置失败")
 
+async def export_csv_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """导出当前管理员所属群组的邀请记录。"""
+    user = update.effective_user
+    if not is_admin(user.id):
+        await update.message.reply_text("你没有权限")
+        return
+    if not redis_client:
+        await update.message.reply_text("❌ Redis 未连接，无法导出")
+        return
+
+    groups = get_groups(user.id)
+    group_ids = set(groups)
+    rows = []
+    for raw in redis_client.lrange(INVITE_LOG_KEY, 0, -1):
+        try:
+            entry = json.loads(raw)
+        except (TypeError, ValueError):
+            continue
+        if str(entry.get("group_id")) not in group_ids:
+            continue
+        rows.append({
+            "created_at": entry.get("created_at", ""),
+            "user_id": entry.get("user_id", ""),
+            "group_id": entry.get("group_id", ""),
+            "group_title": entry.get("group_title", ""),
+            "invite_link": entry.get("invite_link", ""),
+            "revoked": entry.get("revoked", False),
+        })
+
+    output = io.StringIO(newline="")
+    writer = csv.DictWriter(output, fieldnames=["created_at", "user_id", "group_id", "group_title", "invite_link", "revoked"])
+    writer.writeheader()
+    writer.writerows(rows)
+    document = InputFile(io.BytesIO(output.getvalue().encode("utf-8-sig")), filename="invite_logs.csv")
+    await update.message.reply_document(document, caption=f"✅ 已导出 {len(rows)} 条邀请记录")
+
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """显示用户和管理员可用命令。"""
     user = update.effective_user
@@ -2140,7 +2178,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "/listgroups - 查看已绑定群组\n"
             "/setcooldown 群组ID 分钟数|on|off - 设置或开关冷却\n"
             "/setapproval 群组ID on|off - 设置审批模式\n"
-            "/stats - 查看邀请统计\n"
+            "/stats - 查看邀请统计\n            /exportcsv - 导出邀请记录 CSV\n"
             "/test - 检查 Redis 和运行状态\n"
             "/cleanup - 清理过期数据\n"
             "/revoke - 撤销活动邀请链接\n"
@@ -2242,6 +2280,7 @@ async def main():
     application.add_handler(CommandHandler("cancel", cancel_cmd))
     application.add_handler(CommandHandler("test", test_cmd))
     application.add_handler(CommandHandler("stats", stats_cmd))
+    application.add_handler(CommandHandler("exportcsv", export_csv_cmd))
     application.add_handler(CommandHandler("cleanup", cleanup_cmd))
     application.add_handler(CommandHandler("revoke", revoke_cmd))
     application.add_handler(CommandHandler("addadmin", add_admin_cmd))
