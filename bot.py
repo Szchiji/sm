@@ -4,7 +4,7 @@ import redis
 import json
 import asyncio
 import re
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from aiohttp import web
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -12,12 +12,35 @@ from telegram.ext import (
     ChatMemberHandler, ContextTypes, MessageHandler, filters
 )
 
-# 日志配置
-logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
-)
+# 日志配置：统一输出 JSON，便于 Railway 日志检索和告警。
+class JsonFormatter(logging.Formatter):
+    def format(self, record):
+        payload = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "level": record.levelname,
+            "logger": record.name,
+            "message": record.getMessage(),
+        }
+        if record.exc_info:
+            payload["exception"] = self.formatException(record.exc_info)
+        return json.dumps(payload, ensure_ascii=False)
+
+
+logging.basicConfig(level=logging.INFO, handlers=[logging.StreamHandler()])
+for _handler in logging.getLogger().handlers:
+    _handler.setFormatter(JsonFormatter())
 logger = logging.getLogger(__name__)
+
+
+def now_utc():
+    """返回带时区信息的 UTC 时间。"""
+    return datetime.now(timezone.utc)
+
+
+def parse_timestamp(value):
+    """解析时间，并将旧版本无时区时间按 UTC 兼容处理。"""
+    parsed = datetime.fromisoformat(value)
+    return parsed.replace(tzinfo=timezone.utc) if parsed.tzinfo is None else parsed
 
 # 环境变量
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -253,7 +276,7 @@ def save_pending_request(user_id, group_id, user_info, group_title, admin_id):
         "group_id": str(group_id),
         "group_title": group_title,
         "admin_id": admin_id,
-        "created_at": datetime.now().isoformat()
+        "created_at": now_utc().isoformat()
     }
     cooldown_minutes = get_group_cooldown_minutes(group_id, admin_id)
     # 关闭领取冷却时，待审批申请仍保留默认 TTL，避免申请永久堆积。
@@ -345,7 +368,7 @@ def record_user_invite(user_id, group_id, admin_id=None):
         return
     key = f"{USER_INVITE_PREFIX}{user_id}:{group_id}"
     cooldown_minutes = get_group_cooldown_minutes(group_id, admin_id)
-    redis_client.setex(key, cooldown_minutes * 60, datetime.now().isoformat())
+    redis_client.setex(key, cooldown_minutes * 60, now_utc().isoformat())
 
 
 class InviteClaimUnavailable(Exception):
@@ -368,7 +391,7 @@ def claim_invite_slot(user_id, group_id, admin_id=None):
     key = f"{USER_INVITE_PREFIX}{user_id}:{group_id}"
     claimed = redis_client.set(
         key,
-        datetime.now().isoformat(),
+        now_utc().isoformat(),
         nx=True,
         ex=cooldown_minutes * 60,
     )
@@ -403,7 +426,7 @@ def log_invite(user_id, group_id, invite_link, group_title, admin_id=None):
     """记录邀请日志"""
     if not redis_client:
         return
-    now_iso = datetime.now().isoformat()
+    now_iso = now_utc().isoformat()
     log_entry = {
         "user_id": user_id,
         "group_id": group_id,
@@ -454,8 +477,8 @@ async def cleanup_expired_invites():
     for log in logs:
         try:
             entry = json.loads(log)
-            created_at = datetime.fromisoformat(entry['created_at'])
-            if datetime.now() - created_at > timedelta(days=7):
+            created_at = parse_timestamp(entry['created_at'])
+            if now_utc() - created_at > timedelta(days=7):
                 redis_client.lrem(INVITE_LOG_KEY, 0, log)
                 removed += 1
         except:
@@ -519,8 +542,8 @@ async def revoke_expired_invites(application: Application):
             if not created_at_str:
                 logger.warning(f"Skipping invite with missing created_at: {invite_link_url}")
                 continue
-            created_at = datetime.fromisoformat(created_at_str)
-            if datetime.now() - created_at > timedelta(minutes=INVITE_EXPIRE_MINUTES):
+            created_at = parse_timestamp(created_at_str)
+            if now_utc() - created_at > timedelta(minutes=INVITE_EXPIRE_MINUTES):
                 if await revoke_invite_link(application.bot, invite_link_url):
                     revoked += 1
         except Exception as e:
@@ -603,7 +626,7 @@ async def cleanup_expired_data(application: Application):
                         entry = json.loads(log)
                         if entry.get('revoked', False):
                             revoked_total += 1
-                        elif datetime.now() - datetime.fromisoformat(entry['created_at']) < timedelta(days=1):
+                        elif now_utc() - parse_timestamp(entry['created_at']) < timedelta(days=1):
                             active += 1
                         else:
                             expired += 1
@@ -1475,8 +1498,8 @@ async def admin_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
                     continue
                 if entry.get('revoked', False):
                     revoked_count += 1
-                created = datetime.fromisoformat(entry['created_at'])
-                if datetime.now() - created < timedelta(days=1):
+                created = parse_timestamp(entry['created_at'])
+                if now_utc() - created < timedelta(days=1):
                     recent_invites.append(entry)
             except:
                 continue
@@ -1534,7 +1557,7 @@ async def admin_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
                     entry = json.loads(log)
                     if entry.get('revoked', False):
                         revoked += 1
-                    elif datetime.now() - datetime.fromisoformat(entry['created_at']) < timedelta(days=1):
+                    elif now_utc() - parse_timestamp(entry['created_at']) < timedelta(days=1):
                         valid += 1
                     else:
                         expired += 1
@@ -1709,7 +1732,7 @@ async def cleanup_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 entry = json.loads(log)
                 if entry.get('revoked', False):
                     revoked += 1
-                elif datetime.now() - datetime.fromisoformat(entry['created_at']) < timedelta(days=1):
+                elif now_utc() - parse_timestamp(entry['created_at']) < timedelta(days=1):
                     valid += 1
                 else:
                     expired += 1
@@ -1770,8 +1793,8 @@ async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 continue
             if entry.get('revoked', False):
                 revoked_count += 1
-            created = datetime.fromisoformat(entry['created_at'])
-            if datetime.now() - created < timedelta(days=1):
+            created = parse_timestamp(entry['created_at'])
+            if now_utc() - created < timedelta(days=1):
                 recent_invites.append(entry)
         except:
             continue
@@ -2084,10 +2107,93 @@ async def set_cooldown_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("❌ 冷却时间设置失败")
 
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """显示用户和管理员可用命令。"""
+    user = update.effective_user
+    text = (
+        "🤖 入群助手帮助\n\n"
+        "/start - 开始获取群组邀请\n"
+        "/status - 查看当前邀请领取状态\n"
+        "/cancel - 取消当前操作\n"
+    )
+    if is_admin(user.id):
+        text += (
+            "\n管理员命令：\n"
+            "/listgroups - 查看已绑定群组\n"
+            "/setcooldown 群组ID 分钟数|on|off - 设置或开关冷却\n"
+            "/setapproval 群组ID on|off - 设置审批模式\n"
+            "/stats - 查看邀请统计\n"
+            "/test - 检查 Redis 和运行状态\n"
+            "/cleanup - 清理过期数据\n"
+            "/revoke - 撤销活动邀请链接\n"
+            "/bindgroup - 绑定群组\n"
+            "/addadmin - 添加管理员"
+        )
+    await update.message.reply_text(text)
+
+
+async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """查看 Redis、群组和当前用户的邀请冷却状态。"""
+    user = update.effective_user
+    if not redis_client:
+        await update.message.reply_text("❌ Redis 未连接，暂时无法查询状态")
+        return
+
+    try:
+        redis_client.ping()
+        redis_status = "正常"
+    except Exception:
+        redis_status = "异常"
+
+    if is_admin(user.id):
+        groups = get_groups(user.id)
+        lines = [
+            "📊 机器人状态",
+            f"Redis：{redis_status}",
+            f"已绑定群组：{len(groups)} 个",
+            f"默认冷却：{format_cooldown(DEFAULT_COOLDOWN_MINUTES)}",
+        ]
+        for gid, info in groups.items():
+            enabled = get_group_cooldown_minutes(gid, user.id)
+            lines.append(f"• {info['title']}：{format_cooldown(enabled)}")
+        await update.message.reply_text("\n".join(lines))
+        return
+
+    lines = ["📊 你的邀请状态："]
+    found = False
+    for admin_id in get_all_admin_ids():
+        for gid, info in get_groups(admin_id).items():
+            found = True
+            can_get, ttl = can_user_get_invite(user.id, gid, admin_id)
+            if can_get:
+                state = "✅ 可以领取" if get_group_cooldown_minutes(gid, admin_id) else "✅ 冷却已关闭"
+            else:
+                state = f"⏳ 冷却剩余 {format_time_left(ttl)}"
+            lines.append(f"• {info['title']}：{state}")
+    if not found:
+        lines.append("暂无可用群组，请使用 /start")
+    await update.message.reply_text("\n".join(lines))
+
 # HTTP 处理
 async def health_check(request):
-    """健康检查端点"""
-    return web.Response(text="OK", status=200)
+    """存活检查：进程和 HTTP 服务已经启动。"""
+    return web.json_response({"status": "ok"})
+
+
+async def ready_check(request):
+    """就绪检查：Redis 可用且 Telegram 应用已启动。"""
+    application = request.app.get("application")
+    redis_ready = False
+    try:
+        redis_ready = bool(redis_client and redis_client.ping())
+    except Exception:
+        redis_ready = False
+    app_ready = bool(application and application.running)
+    ready = redis_ready and app_ready
+    return web.json_response(
+        {"status": "ready" if ready else "not_ready", "redis": redis_ready, "application": app_ready},
+        status=200 if ready else 503,
+    )
 
 async def webhook_handler(request):
     """处理 Telegram Webhook 请求"""
@@ -2113,6 +2219,8 @@ async def main():
     
     # 命令处理器
     application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("help", help_cmd))
+    application.add_handler(CommandHandler("status", status_cmd))
     application.add_handler(CommandHandler("cancel", cancel_cmd))
     application.add_handler(CommandHandler("test", test_cmd))
     application.add_handler(CommandHandler("stats", stats_cmd))
@@ -2151,6 +2259,8 @@ async def main():
     app['application'] = application
     app.router.add_get("/", health_check)
     app.router.add_get("/health", health_check)
+    app.router.add_get("/healthz", health_check)
+    app.router.add_get("/readyz", ready_check)
     app.router.add_post("/webhook", webhook_handler)
     
     runner = web.AppRunner(app)
