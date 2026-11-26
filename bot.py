@@ -1104,6 +1104,7 @@ async def select_group_callback(update: Update, context: ContextTypes.DEFAULT_TY
         sel_keyboard, sel_text = build_group_selection_keyboard(user_id, admin_id, groups_updated)
         keyboard = [
             [InlineKeyboardButton(f"👉 点击加入 {group_title}", url=invite_link.invite_link)],
+            [InlineKeyboardButton("⬅️ 返回群组菜单", callback_data=f"backselect_{user_id}_{admin_id}")],
             *sel_keyboard
         ]
         await query.edit_message_text(
@@ -1198,6 +1199,9 @@ async def join_all_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text_parts.append("\n".join(status_lines))
     if success_count:
         text_parts.append("🔒 每个链接仅限使用一次")
+    keyboard_buttons.append([
+        InlineKeyboardButton("⬅️ 返回群组菜单", callback_data=f"backselect_{user_id}_{admin_id}")
+    ])
     
     await query.edit_message_text(
         "\n\n".join(text_parts) if text_parts else "处理完成",
@@ -1266,7 +1270,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         log_invite(user_id, group_id, invite_link.invite_link, group_title, admin_id)
         record_user_invite(user_id, group_id, admin_id)
         
-        keyboard = [[InlineKeyboardButton("👉 点击加入群组", url=invite_link.invite_link)]]
+        keyboard = [
+            [InlineKeyboardButton("👉 点击加入群组", url=invite_link.invite_link)],
+            [InlineKeyboardButton("⬅️ 返回群组菜单", callback_data=f"backselect_{user_id}_{admin_id}")],
+        ]
         await query.edit_message_text(
             f"✅ 已为你生成专属邀请链接\n🔒 仅限使用一次",
             reply_markup=InlineKeyboardMarkup(keyboard)
