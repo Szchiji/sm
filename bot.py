@@ -1730,7 +1730,13 @@ async def admin_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
 
     state = get_admin_state(user.id)
     if not state:
-        return
+        # 绑定提示与输入可能跨越 webhook/Redis 状态刷新；管理员直接发送
+        # Telegram 群组 ID 时也进入绑定流程，避免消息被静默忽略。
+        if re.fullmatch(r"-100\d{5,}", update.message.text.strip()):
+            state = {"action": "bind_group_id"}
+            logger.info("Recovered bind-group input state for admin %s", user.id)
+        else:
+            return
 
     text = update.message.text.strip()
     action = state.get("action")
