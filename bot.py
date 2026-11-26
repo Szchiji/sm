@@ -15,7 +15,7 @@ from telegram.ext import (
 
 from bot_config import *  # noqa: F403 - 运行配置集中在 bot_config.py
 from bot_utils import JsonFormatter, now_utc, parse_timestamp
-from drive_backup import BACKUP_INTERVAL_SECONDS, BACKUP_LAST_KEY, upload_snapshot
+from drive_backup import BACKUP_LAST_KEY, upload_snapshot
 
 # 日志配置：统一输出 JSON，便于 Railway 日志检索和告警。
 logging.basicConfig(level=logging.INFO, handlers=[logging.StreamHandler()])
@@ -643,7 +643,7 @@ async def send_single_invite(update, context, user, group_id, group_title, admin
         if groups.get(str(group_id), {}).get('approval_required', False):
             return await request_join_approval(update, context, user, group_id, group_title, admin_id)
 
-    can_get, ttl = can_user_get_invite(user.id, group_id)
+    can_get, ttl = can_user_get_invite(user.id, group_id, admin_id)
     if not can_get:
         time_left = format_time_left(ttl)
         await update.message.reply_text(
@@ -652,10 +652,10 @@ async def send_single_invite(update, context, user, group_id, group_title, admin
         return False
     
     try:
-        invite_link = await create_claimed_invite(context.bot, user.id, group_id)
+        invite_link = await create_claimed_invite(context.bot, user.id, group_id, admin_id)
         
         log_invite(user.id, group_id, invite_link.invite_link, group_title, admin_id)
-        record_user_invite(user.id, group_id)
+        record_user_invite(user.id, group_id, admin_id)
         
         keyboard = [[InlineKeyboardButton(f"👉 加入 {group_title}", url=invite_link.invite_link)]]
         await update.message.reply_text(
@@ -673,7 +673,7 @@ def build_group_selection_keyboard(user_id, admin_id, groups):
     """构建群组选择键盘和提示文本"""
     keyboard = []
     for gid, info in groups.items():
-        can_get, ttl = can_user_get_invite(user_id, gid)
+        can_get, ttl = can_user_get_invite(user_id, gid, admin_id)
         if not can_get:
             label = f"✅ {info['title']} (已领取)"
         elif info.get('approval_required', False):
@@ -712,7 +712,7 @@ async def handle_join_direct(update: Update, context: ContextTypes.DEFAULT_TYPE,
     keyboard = []
     has_invite = False
     for gid, (title, admin_id, info) in all_groups.items():
-        can_get, ttl = can_user_get_invite(user.id, gid)
+        can_get, ttl = can_user_get_invite(user.id, gid, admin_id)
         if not can_get:
             keyboard.append([InlineKeyboardButton(
                 f"✅ {title} (冷却 {format_time_left(ttl)})",
@@ -725,9 +725,9 @@ async def handle_join_direct(update: Update, context: ContextTypes.DEFAULT_TYPE,
             )])
         else:
             try:
-                invite_link = await create_claimed_invite(context.bot, user.id, gid)
+                invite_link = await create_claimed_invite(context.bot, user.id, gid, admin_id)
                 log_invite(user.id, gid, invite_link.invite_link, title, admin_id)
-                record_user_invite(user.id, gid)
+                record_user_invite(user.id, gid, admin_id)
                 keyboard.append([InlineKeyboardButton(f"👉 加入 {title}", url=invite_link.invite_link)])
                 has_invite = True
             except Exception as e:
@@ -763,7 +763,7 @@ async def handle_join_flow(update: Update, context: ContextTypes.DEFAULT_TYPE, u
     has_invite = False
     for gid, info in groups.items():
         title = info['title']
-        can_get, ttl = can_user_get_invite(user.id, gid)
+        can_get, ttl = can_user_get_invite(user.id, gid, admin_id)
         if not can_get:
             keyboard.append([InlineKeyboardButton(
                 f"✅ {title} (冷却 {format_time_left(ttl)})",
@@ -776,9 +776,9 @@ async def handle_join_flow(update: Update, context: ContextTypes.DEFAULT_TYPE, u
             )])
         else:
             try:
-                invite_link = await create_claimed_invite(context.bot, user.id, gid)
+                invite_link = await create_claimed_invite(context.bot, user.id, gid, admin_id)
                 log_invite(user.id, gid, invite_link.invite_link, title, admin_id)
-                record_user_invite(user.id, gid)
+                record_user_invite(user.id, gid, admin_id)
                 keyboard.append([InlineKeyboardButton(f"👉 加入 {title}", url=invite_link.invite_link)])
                 has_invite = True
             except Exception as e:
@@ -812,7 +812,7 @@ async def handle_join_all(update: Update, context: ContextTypes.DEFAULT_TYPE, us
     cooling_groups = []
     
     for gid, info in groups.items():
-        can_get, ttl = can_user_get_invite(user.id, gid)
+        can_get, ttl = can_user_get_invite(user.id, gid, admin_id)
         if can_get:
             available_groups.append((gid, info['title']))
         else:
@@ -869,9 +869,9 @@ async def handle_join_all(update: Update, context: ContextTypes.DEFAULT_TYPE, us
                     failed_groups.append(title)
         else:
             try:
-                invite_link = await create_claimed_invite(context.bot, user.id, gid)
+                invite_link = await create_claimed_invite(context.bot, user.id, gid, admin_id)
                 log_invite(user.id, gid, invite_link.invite_link, title, admin_id)
-                record_user_invite(user.id, gid)
+                record_user_invite(user.id, gid, admin_id)
                 keyboard_buttons.append([InlineKeyboardButton(f"👉 加入 {title}", url=invite_link.invite_link)])
                 success_count += 1
             except Exception as e:
@@ -1046,7 +1046,7 @@ async def select_group_callback(update: Update, context: ContextTypes.DEFAULT_TY
     group_title = groups[group_id]['title']
 
     # 检查冷却时间 - 直接返回第一个界面，无需额外点击
-    can_get, ttl = can_user_get_invite(user_id, group_id)
+    can_get, ttl = can_user_get_invite(user_id, group_id, admin_id)
     if not can_get:
         keyboard, text = build_group_selection_keyboard(user_id, admin_id, groups)
         await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
@@ -1088,10 +1088,10 @@ async def select_group_callback(update: Update, context: ContextTypes.DEFAULT_TY
 
     # 直接生成邀请链接，无需二次确认
     try:
-        invite_link = await create_claimed_invite(context.bot, user_id, group_id)
+        invite_link = await create_claimed_invite(context.bot, user_id, group_id, admin_id)
 
         log_invite(user_id, group_id, invite_link.invite_link, group_title, admin_id)
-        record_user_invite(user_id, group_id)
+        record_user_invite(user_id, group_id, admin_id)
 
         # 生成成功后直接返回第一个界面（群组选择），邀请按钮置顶
         groups_updated = get_groups(admin_id)
@@ -1137,7 +1137,7 @@ async def join_all_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     for gid, info in groups.items():
         # 检查冷却
-        can_get, ttl = can_user_get_invite(user_id, gid)
+        can_get, ttl = can_user_get_invite(user_id, gid, admin_id)
         if not can_get:
             status_lines.append(f"✅ {info['title']} (已领取，冷却 {format_time_left(ttl)})")
             continue
@@ -1171,11 +1171,11 @@ async def join_all_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         try:
             # 生成邀请
-            invite_link = await create_claimed_invite(context.bot, user_id, gid)
+            invite_link = await create_claimed_invite(context.bot, user_id, gid, admin_id)
             
             # 记录
             log_invite(user_id, gid, invite_link.invite_link, info['title'], admin_id)
-            record_user_invite(user_id, gid)
+            record_user_invite(user_id, gid, admin_id)
             
             keyboard_buttons.append([InlineKeyboardButton(f"👉 加入 {info['title']}", url=invite_link.invite_link)])
             success_count += 1
@@ -1238,8 +1238,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer("这不是你的链接", show_alert=True)
         return
     
+    # 通过群组反向索引获取管理员，所有冷却操作使用同一上下文
+    admin_id_str = redis_client.get(f"{GROUP_OWNER_PREFIX}{group_id}") if redis_client else None
+    admin_id = int(admin_id_str) if admin_id_str else None
+
     # 再次检查冷却时间
-    can_get, ttl = can_user_get_invite(user_id, group_id)
+    can_get, ttl = can_user_get_invite(user_id, group_id, admin_id)
     if not can_get:
         time_left = format_time_left(ttl)
         await query.edit_message_text(
@@ -1248,15 +1252,13 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     try:
-        invite_link = await create_claimed_invite(context.bot, user_id, group_id)
+        invite_link = await create_claimed_invite(context.bot, user_id, group_id, admin_id)
         
         # 记录邀请
-        admin_id_str = redis_client.get(f"{GROUP_OWNER_PREFIX}{group_id}") if redis_client else None
-        admin_id = int(admin_id_str) if admin_id_str else None
         groups = get_groups(admin_id) if admin_id else {}
         group_title = groups.get(group_id, {}).get('title', 'Unknown')
         log_invite(user_id, group_id, invite_link.invite_link, group_title, admin_id)
-        record_user_invite(user_id, group_id)
+        record_user_invite(user_id, group_id, admin_id)
         
         keyboard = [[InlineKeyboardButton("👉 点击加入群组", url=invite_link.invite_link)]]
         await query.edit_message_text(
@@ -1297,9 +1299,9 @@ async def approve_request_callback(update: Update, context: ContextTypes.DEFAULT
     group_title = req['group_title']
 
     try:
-        invite_link = await create_claimed_invite(context.bot, user_id, group_id)
+        invite_link = await create_claimed_invite(context.bot, user_id, group_id, admin_id)
         log_invite(user_id, group_id, invite_link.invite_link, group_title, admin_id)
-        record_user_invite(user_id, group_id)
+        record_user_invite(user_id, group_id, admin_id)
         delete_pending_request(user_id, group_id)
 
         try:
