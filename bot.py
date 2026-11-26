@@ -26,13 +26,13 @@ for _handler in logging.getLogger().handlers:
 logger = logging.getLogger(__name__)
 
 # 连接 Redis
+redis_client = None
 try:
     redis_client = redis.from_url(REDIS_URL, decode_responses=True)
     redis_client.ping()
     logger.info("Redis connected successfully")
 except Exception as e:
     logger.error(f"Redis connection failed: {e}")
-redis_client = None
 
 
 USER_MENU_KEY_PREFIX = "tg_bot:user_menu:"
