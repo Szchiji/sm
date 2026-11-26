@@ -263,6 +263,54 @@ def record_user_invite(user_id, group_id):
     key = f"{USER_INVITE_PREFIX}{user_id}:{group_id}"
     redis_client.setex(key, INVITE_COOLDOWN_HOURS * 3600, datetime.now().isoformat())
 
+
+class InviteClaimUnavailable(Exception):
+    """用户在冷却期内，无法再次领取同一群组邀请。"""
+
+    def __init__(self, ttl):
+        self.ttl = max(ttl, 0)
+        super().__init__(f"invite claim unavailable for {self.ttl}s")
+
+
+def claim_invite_slot(user_id, group_id):
+    """以 Redis SET NX 原子占用领取名额，避免并发请求重复发链接。"""
+    if not redis_client:
+        return True, 0
+
+    key = f"{USER_INVITE_PREFIX}{user_id}:{group_id}"
+    claimed = redis_client.set(
+        key,
+        datetime.now().isoformat(),
+        nx=True,
+        ex=INVITE_COOLDOWN_HOURS * 3600,
+    )
+    if claimed:
+        return True, 0
+
+    return False, redis_client.ttl(key)
+
+
+def release_invite_slot(user_id, group_id):
+    """邀请生成失败时释放领取名额，使用户可以重试。"""
+    if redis_client:
+        redis_client.delete(f"{USER_INVITE_PREFIX}{user_id}:{group_id}")
+
+
+async def create_claimed_invite(bot, user_id, group_id):
+    """原子占用领取名额后创建一次性邀请，失败时自动回滚名额。"""
+    claimed, ttl = claim_invite_slot(user_id, group_id)
+    if not claimed:
+        raise InviteClaimUnavailable(ttl)
+
+    try:
+        return await bot.create_chat_invite_link(
+            chat_id=int(group_id),
+            member_limit=1,
+        )
+    except Exception:
+        release_invite_slot(user_id, group_id)
+        raise
+
 def log_invite(user_id, group_id, invite_link, group_title, admin_id=None):
     """记录邀请日志"""
     if not redis_client:
@@ -533,10 +581,7 @@ async def send_single_invite(update, context, user, group_id, group_title, admin
         return False
     
     try:
-        invite_link = await context.bot.create_chat_invite_link(
-            chat_id=int(group_id),
-            member_limit=1
-        )
+        invite_link = await create_claimed_invite(context.bot, user.id, group_id)
         
         log_invite(user.id, group_id, invite_link.invite_link, group_title, admin_id)
         record_user_invite(user.id, group_id)
@@ -609,10 +654,7 @@ async def handle_join_direct(update: Update, context: ContextTypes.DEFAULT_TYPE,
             )])
         else:
             try:
-                invite_link = await context.bot.create_chat_invite_link(
-                    chat_id=int(gid),
-                    member_limit=1
-                )
+                invite_link = await create_claimed_invite(context.bot, user.id, gid)
                 log_invite(user.id, gid, invite_link.invite_link, title, admin_id)
                 record_user_invite(user.id, gid)
                 keyboard.append([InlineKeyboardButton(f"👉 加入 {title}", url=invite_link.invite_link)])
@@ -663,10 +705,7 @@ async def handle_join_flow(update: Update, context: ContextTypes.DEFAULT_TYPE, u
             )])
         else:
             try:
-                invite_link = await context.bot.create_chat_invite_link(
-                    chat_id=int(gid),
-                    member_limit=1
-                )
+                invite_link = await create_claimed_invite(context.bot, user.id, gid)
                 log_invite(user.id, gid, invite_link.invite_link, title, admin_id)
                 record_user_invite(user.id, gid)
                 keyboard.append([InlineKeyboardButton(f"👉 加入 {title}", url=invite_link.invite_link)])
@@ -759,10 +798,7 @@ async def handle_join_all(update: Update, context: ContextTypes.DEFAULT_TYPE, us
                     failed_groups.append(title)
         else:
             try:
-                invite_link = await context.bot.create_chat_invite_link(
-                    chat_id=int(gid),
-                    member_limit=1
-                )
+                invite_link = await create_claimed_invite(context.bot, user.id, gid)
                 log_invite(user.id, gid, invite_link.invite_link, title, admin_id)
                 record_user_invite(user.id, gid)
                 keyboard_buttons.append([InlineKeyboardButton(f"👉 加入 {title}", url=invite_link.invite_link)])
@@ -934,10 +970,7 @@ async def select_group_callback(update: Update, context: ContextTypes.DEFAULT_TY
 
     # 直接生成邀请链接，无需二次确认
     try:
-        invite_link = await context.bot.create_chat_invite_link(
-            chat_id=int(group_id),
-            member_limit=1
-        )
+        invite_link = await create_claimed_invite(context.bot, user_id, group_id)
 
         log_invite(user_id, group_id, invite_link.invite_link, group_title, admin_id)
         record_user_invite(user_id, group_id)
@@ -1020,10 +1053,7 @@ async def join_all_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         try:
             # 生成邀请
-            invite_link = await context.bot.create_chat_invite_link(
-                chat_id=int(gid),
-                member_limit=1
-            )
+            invite_link = await create_claimed_invite(context.bot, user_id, gid)
             
             # 记录
             log_invite(user_id, gid, invite_link.invite_link, info['title'], admin_id)
@@ -1100,10 +1130,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     try:
-        invite_link = await context.bot.create_chat_invite_link(
-            chat_id=int(group_id),
-            member_limit=1
-        )
+        invite_link = await create_claimed_invite(context.bot, user_id, group_id)
         
         # 记录邀请
         admin_id_str = redis_client.get(f"{GROUP_OWNER_PREFIX}{group_id}") if redis_client else None
@@ -1145,13 +1172,14 @@ async def approve_request_callback(update: Update, context: ContextTypes.DEFAULT
         await query.edit_message_text("❌ 申请已过期或不存在")
         return
 
+    if int(req.get("admin_id", -1)) != admin_id:
+        await query.answer("⛔ 你不是该群组的管理员", show_alert=True)
+        return
+
     group_title = req['group_title']
 
     try:
-        invite_link = await context.bot.create_chat_invite_link(
-            chat_id=int(group_id),
-            member_limit=1
-        )
+        invite_link = await create_claimed_invite(context.bot, user_id, group_id)
         log_invite(user_id, group_id, invite_link.invite_link, group_title, admin_id)
         record_user_invite(user_id, group_id)
         delete_pending_request(user_id, group_id)
@@ -1187,9 +1215,18 @@ async def reject_request_callback(update: Update, context: ContextTypes.DEFAULT_
 
     user_id = int(parts[1])
     group_id = parts[2]
+    admin_id = query.from_user.id
 
     req = get_pending_request(user_id, group_id)
-    group_title = req['group_title'] if req else "未知群组"
+    if not req:
+        await query.edit_message_text("❌ 申请已过期或不存在")
+        return
+
+    if int(req.get("admin_id", -1)) != admin_id:
+        await query.answer("⛔ 你不是该群组的管理员", show_alert=True)
+        return
+
+    group_title = req['group_title']
     delete_pending_request(user_id, group_id)
 
     try:
@@ -1201,7 +1238,7 @@ async def reject_request_callback(update: Update, context: ContextTypes.DEFAULT_
         logger.error(f"Failed to notify user {user_id}: {e}")
 
     await query.edit_message_text(f"❌ 已拒绝用户 {user_id} 加入「{group_title}」")
-    logger.info(f"Admin {query.from_user.id} rejected join request: user {user_id} -> group {group_id}")
+    logger.info(f"Admin {admin_id} rejected join request: user {user_id} -> group {group_id}")
 
 async def admin_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """处理管理员面板的所有 adm_* 回调按钮"""
@@ -1773,6 +1810,23 @@ async def bot_removed_from_group(update: Update, context: ContextTypes.DEFAULT_T
         remove_group(chat.id)
         logger.info(f"Bot left group: {chat.title if chat else 'Unknown'}")
 
+async def verify_group_invite_permission(bot, group_id):
+    """验证群组存在，且机器人有创建邀请链接的管理员权限。"""
+    chat = await bot.get_chat(chat_id=group_id)
+    if chat.type not in ("group", "supergroup"):
+        return False, "只支持 Telegram 群组或超级群组"
+
+    me = await bot.get_me()
+    member = await bot.get_chat_member(chat_id=group_id, user_id=me.id)
+    if member.status == "creator":
+        return True, ""
+    if member.status != "administrator":
+        return False, "机器人不是该群组管理员"
+    if not getattr(member, "can_invite_users", False):
+        return False, "机器人没有创建邀请链接的权限"
+    return True, ""
+
+
 async def bind_group_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """手动绑定群组"""
     user = update.effective_user
@@ -1788,8 +1842,26 @@ async def bind_group_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
     
-    group_id = context.args[0]
+    try:
+        group_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("❌ 群组 ID 必须是数字，例如 -1001234567890")
+        return
+
     group_title = " ".join(context.args[1:])
+
+    try:
+        allowed, reason = await verify_group_invite_permission(context.bot, group_id)
+    except Exception as e:
+        logger.warning("Failed to verify group %s: %s", group_id, e)
+        await update.message.reply_text(
+            "❌ 无法访问该群组。请确认群组 ID 正确，并已将机器人加入群组。"
+        )
+        return
+
+    if not allowed:
+        await update.message.reply_text(f"❌ 无法绑定：{reason}")
+        return
     
     if save_group(group_id, group_title, user.id):
         await update.message.reply_text(
