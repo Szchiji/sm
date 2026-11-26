@@ -26,7 +26,11 @@ WELCOME_TEXT = os.getenv("WELCOME_TEXT", "👋 欢迎！请选择要加入的群
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 PORT = int(os.environ.get("PORT", 8080))
 INVITE_EXPIRE_MINUTES = int(os.getenv("INVITE_EXPIRE_MINUTES", "1440"))
-INVITE_COOLDOWN_HOURS = int(os.getenv("INVITE_COOLDOWN_HOURS", "24"))
+# 默认冷却时间使用分钟；兼容旧的 INVITE_COOLDOWN_HOURS 环境变量
+_legacy_cooldown_hours = int(os.getenv("INVITE_COOLDOWN_HOURS", "24"))
+DEFAULT_COOLDOWN_MINUTES = int(os.getenv("INVITE_COOLDOWN_MINUTES", str(_legacy_cooldown_hours * 60)))
+MIN_COOLDOWN_MINUTES = 1
+MAX_COOLDOWN_MINUTES = 43200  # 30 天
 
 # Railway 域名检测
 RAILWAY_DOMAIN = (
@@ -121,7 +125,8 @@ def save_group(group_id, title, added_by):
             "title": title,
             "added_by": added_by,
             "invite_link": None,
-            "cooldown_hours": INVITE_COOLDOWN_HOURS
+            "cooldown_minutes": DEFAULT_COOLDOWN_MINUTES,
+            "cooldown_enabled": True
         }
         redis_client.set(groups_key(added_by), json.dumps(groups))
         # 记录反向查找：group_id -> admin_id
@@ -168,35 +173,72 @@ def set_group_approval(group_id, admin_id, required: bool):
         return False
 
 
-def get_group_cooldown_hours(group_id, admin_id=None):
-    """读取群组独立冷却时间；旧数据或无效配置回退到全局默认值。"""
+def format_cooldown(minutes):
+    """将分钟格式化为用户友好的显示文本。0 表示已关闭。"""
+    return "已关闭" if not minutes else f"{minutes} 分钟"
+
+
+def get_group_cooldown_minutes(group_id, admin_id=None):
+    """读取群组冷却分钟数；兼容旧小时配置和无效配置。0 表示已关闭。"""
     if admin_id is None and redis_client:
         admin_id = redis_client.get(f"{GROUP_OWNER_PREFIX}{group_id}")
     if admin_id is not None:
         info = get_groups(admin_id).get(str(group_id), {})
+        if info.get("cooldown_enabled") is False:
+            return 0
         try:
-            value = int(info.get("cooldown_hours", INVITE_COOLDOWN_HOURS))
-            if 1 <= value <= 720:
+            if "cooldown_minutes" in info:
+                value = int(info["cooldown_minutes"])
+            elif "cooldown_hours" in info:
+                value = int(info["cooldown_hours"]) * 60
+            else:
+                value = DEFAULT_COOLDOWN_MINUTES
+            if MIN_COOLDOWN_MINUTES <= value <= MAX_COOLDOWN_MINUTES:
                 return value
         except (TypeError, ValueError):
             pass
-    return INVITE_COOLDOWN_HOURS
+    return DEFAULT_COOLDOWN_MINUTES
 
 
-def set_group_cooldown(group_id, admin_id, cooldown_hours):
-    """设置管理员所属群组的独立冷却时间，范围为 1 至 720 小时。"""
-    if not redis_client or not 1 <= cooldown_hours <= 720:
+def set_group_cooldown(group_id, admin_id, cooldown_minutes):
+    """设置管理员所属群组的冷却时间，范围为 1 至 43200 分钟，并启用冷却。"""
+    if not redis_client or not MIN_COOLDOWN_MINUTES <= cooldown_minutes <= MAX_COOLDOWN_MINUTES:
         return False
     try:
         groups = get_groups(admin_id)
         gid = str(group_id)
         if gid not in groups:
             return False
-        groups[gid]["cooldown_hours"] = cooldown_hours
+        groups[gid]["cooldown_minutes"] = cooldown_minutes
+        groups[gid]["cooldown_enabled"] = True
         redis_client.set(groups_key(admin_id), json.dumps(groups))
         return True
     except Exception as e:
         logger.error(f"Failed to set cooldown for group {group_id}: {e}")
+        return False
+
+
+def set_group_cooldown_enabled(group_id, admin_id, enabled):
+    """开启或关闭指定群组的邀请冷却。"""
+    if not redis_client:
+        return False
+    try:
+        groups = get_groups(admin_id)
+        gid = str(group_id)
+        if gid not in groups:
+            return False
+        groups[gid]["cooldown_enabled"] = bool(enabled)
+        if "cooldown_minutes" not in groups[gid]:
+            # 兼容上一版本保存的小时字段，开启时保留原有冷却时间。
+            legacy_hours = groups[gid].get("cooldown_hours")
+            try:
+                groups[gid]["cooldown_minutes"] = int(legacy_hours) * 60
+            except (TypeError, ValueError):
+                groups[gid]["cooldown_minutes"] = DEFAULT_COOLDOWN_MINUTES
+        redis_client.set(groups_key(admin_id), json.dumps(groups))
+        return True
+    except Exception as e:
+        logger.error(f"Failed to toggle cooldown for group {group_id}: {e}")
         return False
 
 def save_pending_request(user_id, group_id, user_info, group_title, admin_id):
@@ -213,8 +255,10 @@ def save_pending_request(user_id, group_id, user_info, group_title, admin_id):
         "admin_id": admin_id,
         "created_at": datetime.now().isoformat()
     }
-    cooldown_hours = get_group_cooldown_hours(group_id, admin_id)
-    redis_client.setex(key, cooldown_hours * 3600, json.dumps(data))
+    cooldown_minutes = get_group_cooldown_minutes(group_id, admin_id)
+    # 关闭领取冷却时，待审批申请仍保留默认 TTL，避免申请永久堆积。
+    pending_ttl = (cooldown_minutes or DEFAULT_COOLDOWN_MINUTES) * 60
+    redis_client.setex(key, pending_ttl, json.dumps(data))
     return True
 
 def get_pending_request(user_id, group_id):
@@ -284,6 +328,9 @@ def can_user_get_invite(user_id, group_id, admin_id=None):
     if not redis_client:
         return True, 0
     
+    if get_group_cooldown_minutes(group_id, admin_id) == 0:
+        return True, 0
+
     key = f"{USER_INVITE_PREFIX}{user_id}:{group_id}"
     if redis_client.exists(key):
         ttl = redis_client.ttl(key)
@@ -294,9 +341,11 @@ def record_user_invite(user_id, group_id, admin_id=None):
     """记录用户获取邀请的时间"""
     if not redis_client:
         return
+    if get_group_cooldown_minutes(group_id, admin_id) == 0:
+        return
     key = f"{USER_INVITE_PREFIX}{user_id}:{group_id}"
-    cooldown_hours = get_group_cooldown_hours(group_id, admin_id)
-    redis_client.setex(key, cooldown_hours * 3600, datetime.now().isoformat())
+    cooldown_minutes = get_group_cooldown_minutes(group_id, admin_id)
+    redis_client.setex(key, cooldown_minutes * 60, datetime.now().isoformat())
 
 
 class InviteClaimUnavailable(Exception):
@@ -312,13 +361,16 @@ def claim_invite_slot(user_id, group_id, admin_id=None):
     if not redis_client:
         return True, 0
 
+    cooldown_minutes = get_group_cooldown_minutes(group_id, admin_id)
+    if cooldown_minutes == 0:
+        return True, 0
+
     key = f"{USER_INVITE_PREFIX}{user_id}:{group_id}"
-    cooldown_hours = get_group_cooldown_hours(group_id, admin_id)
     claimed = redis_client.set(
         key,
         datetime.now().isoformat(),
         nx=True,
-        ex=cooldown_hours * 3600,
+        ex=cooldown_minutes * 60,
     )
     if claimed:
         return True, 0
@@ -888,7 +940,7 @@ def build_admin_main_text(user_id):
     return (
         f"🤖 管理员面板\n\n"
         f"已绑定群组: {len(groups)} 个\n"
-        f"邀请冷却: 按群组设置（默认 {INVITE_COOLDOWN_HOURS} 小时）"
+        f"邀请冷却: 按群组设置（默认 {format_cooldown(DEFAULT_COOLDOWN_MINUTES)}）"
     )
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1332,7 +1384,7 @@ async def admin_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
             return
         info = groups[gid]
         approval = "🔒 需审批" if info.get('approval_required', False) else "🔓 直接加入"
-        cooldown_hours = get_group_cooldown_hours(gid, user.id)
+        cooldown_minutes = get_group_cooldown_minutes(gid, user.id)
         toggle_label = "🔓 切换为直接加入" if info.get('approval_required', False) else "🔒 切换为需审批"
         keyboard = [
             [InlineKeyboardButton(toggle_label, callback_data=f"adm_grp_tog_{gid}")],
@@ -1340,7 +1392,7 @@ async def admin_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
             [InlineKeyboardButton("⬅️ 返回群组列表", callback_data="adm_groups")],
         ]
         await query.edit_message_text(
-            f"群组：{info['title']}\nID: `{gid}`\n审批模式: {approval}\n冷却时间: {cooldown_hours} 小时\n\n可用命令：/setcooldown {gid} [小时数]",
+            f"群组：{info['title']}\nID: `{gid}`\n审批模式: {approval}\n冷却时间: {format_cooldown(cooldown_minutes)}\n\n可用命令：/setcooldown {gid} [分钟数|on|off]",
             reply_markup=InlineKeyboardMarkup(keyboard),
             parse_mode="Markdown"
         )
@@ -1436,7 +1488,7 @@ async def admin_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
             f"独立用户: {unique_users}\n"
             f"已撤销链接: {revoked_count}\n\n"
             f"配置:\n"
-            f"邀请冷却: 按群组设置（默认 {INVITE_COOLDOWN_HOURS} 小时）"
+            f"邀请冷却: 按群组设置（默认 {format_cooldown(DEFAULT_COOLDOWN_MINUTES)}）"
         )
         await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(back_btn))
         return
@@ -1462,7 +1514,7 @@ async def admin_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
             f"🧪 测试报告\n\n"
             f"Redis 状态: {redis_status}\n"
             f"已绑定群组: {len(groups)} 个\n"
-            f"邀请冷却: 按群组设置（默认 {INVITE_COOLDOWN_HOURS} 小时）\n"
+            f"邀请冷却: 按群组设置（默认 {format_cooldown(DEFAULT_COOLDOWN_MINUTES)}）\n"
             f"当前用户ID: {user.id}\n"
             f"是否为管理员: 是"
         )
@@ -1734,7 +1786,7 @@ async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"独立用户: {unique_users}\n"
         f"已撤销链接: {revoked_count}\n\n"
         f"配置:\n"
-        f"邀请冷却: 按群组设置（默认 {INVITE_COOLDOWN_HOURS} 小时）"
+        f"邀请冷却: 按群组设置（默认 {format_cooldown(DEFAULT_COOLDOWN_MINUTES)}）"
     )
     
     await update.message.reply_text(text)
@@ -1754,7 +1806,7 @@ async def test_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🧪 测试报告\n\n"
         f"Redis 状态: {redis_status}\n"
         f"已绑定群组: {len(groups)} 个\n"
-        f"邀请冷却: 按群组设置（默认 {INVITE_COOLDOWN_HOURS} 小时）\n"
+        f"邀请冷却: 按群组设置（默认 {format_cooldown(DEFAULT_COOLDOWN_MINUTES)}）\n"
         f"当前用户ID: {user.id}\n"
         f"是否为管理员: {is_admin(user.id)}"
     )
@@ -1974,7 +2026,7 @@ async def remove_group_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def set_cooldown_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """设置指定群组的邀请领取冷却时间。"""
+    """设置指定群组的邀请领取冷却时间，或开启/关闭冷却。"""
     user = update.effective_user
 
     if not is_admin(user.id):
@@ -1983,30 +2035,50 @@ async def set_cooldown_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if len(context.args) != 2:
         await update.message.reply_text(
-            "用法: /setcooldown [群组ID] [小时数]\n"
-            "示例: /setcooldown -1001234567890 6\n"
-            "小时数范围：1 至 720"
+            "用法：/setcooldown [群组ID] [分钟数|on|off]\n"
+            "示例：/setcooldown -1001234567890 30\n"
+            "设置范围：1 至 43200 分钟（30天）\n"
+            "关闭：/setcooldown [群组ID] off\n"
+            "开启：/setcooldown [群组ID] on"
         )
         return
 
     group_id = str(context.args[0])
-    try:
-        cooldown_hours = int(context.args[1])
-    except ValueError:
-        await update.message.reply_text("❌ 小时数必须是整数，范围为 1 至 720")
-        return
-
+    action = context.args[1].lower()
     groups = get_groups(user.id)
     if group_id not in groups:
         await update.message.reply_text("❌ 未找到该群组，或你无权修改它")
         return
-    if not 1 <= cooldown_hours <= 720:
-        await update.message.reply_text("❌ 小时数必须在 1 至 720 之间")
+
+    title = groups[group_id]["title"]
+    if action == "off":
+        if set_group_cooldown_enabled(group_id, user.id, False):
+            await update.message.reply_text(f"✅ 已关闭「{title}」的邀请冷却\n用户现在可以重复领取邀请。")
+        else:
+            await update.message.reply_text("❌ 冷却开关设置失败")
         return
 
-    if set_group_cooldown(group_id, user.id, cooldown_hours):
+    if action == "on":
+        if set_group_cooldown_enabled(group_id, user.id, True):
+            minutes = get_group_cooldown_minutes(group_id, user.id)
+            await update.message.reply_text(f"✅ 已开启「{title}」的邀请冷却\n当前冷却时间：{format_cooldown(minutes)}")
+        else:
+            await update.message.reply_text("❌ 冷却开关设置失败")
+        return
+
+    try:
+        cooldown_minutes = int(action)
+    except ValueError:
+        await update.message.reply_text("❌ 请输入分钟数，或使用 on/off 开关")
+        return
+
+    if not MIN_COOLDOWN_MINUTES <= cooldown_minutes <= MAX_COOLDOWN_MINUTES:
+        await update.message.reply_text("❌ 分钟数必须在 1 至 43200 之间")
+        return
+
+    if set_group_cooldown(group_id, user.id, cooldown_minutes):
         await update.message.reply_text(
-            f"✅ 已将「{groups[group_id]['title']}」的冷却时间设置为 {cooldown_hours} 小时\n"
+            f"✅ 已将「{title}」的冷却时间设置为 {format_cooldown(cooldown_minutes)}\n"
             "该设置对之后新领取的邀请生效。"
         )
     else:
@@ -2035,7 +2107,7 @@ async def main():
         init_admin_from_env()
         migrate_global_groups()
         logger.info(f"Loaded admins: {get_admin_ids_from_env()}")
-        logger.info(f"Default cooldown: {INVITE_COOLDOWN_HOURS}h, per-group cooldown enabled")
+        logger.info(f"Default cooldown: {DEFAULT_COOLDOWN_MINUTES}m, per-group cooldown with toggle enabled")
     
     application = Application.builder().token(BOT_TOKEN).build()
     
