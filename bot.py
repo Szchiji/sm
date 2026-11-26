@@ -30,7 +30,40 @@ try:
     logger.info("Redis connected successfully")
 except Exception as e:
     logger.error(f"Redis connection failed: {e}")
-    redis_client = None
+redis_client = None
+
+
+USER_MENU_KEY_PREFIX = "tg_bot:user_menu:"
+
+
+async def clear_user_menu(bot, user_id):
+    """删除机器人为用户保存的上一条主菜单消息。"""
+    if not redis_client:
+        return
+    key = f"{USER_MENU_KEY_PREFIX}{user_id}"
+    raw = redis_client.get(key)
+    redis_client.delete(key)
+    if not raw:
+        return
+    try:
+        menu = json.loads(raw)
+        await bot.delete_message(
+            chat_id=menu["chat_id"], message_id=menu["message_id"]
+        )
+    except Exception as exc:
+        logger.info("Previous user menu could not be deleted: %s", exc)
+
+
+async def send_user_menu(update, context, text, reply_markup):
+    """发送并记录用户唯一主菜单，后续 /start 可删除它。"""
+    message = await update.message.reply_text(text, reply_markup=reply_markup)
+    if redis_client:
+        redis_client.set(
+            f"{USER_MENU_KEY_PREFIX}{update.effective_user.id}",
+            json.dumps({"chat_id": message.chat_id, "message_id": message.message_id}),
+        )
+    return message
+
 
 def get_admin_ids_from_env():
     """从环境变量获取管理员ID列表"""
@@ -731,7 +764,7 @@ async def handle_join_direct(update: Update, context: ContextTypes.DEFAULT_TYPE,
         keyboard = [[InlineKeyboardButton(
             f"👉 获取 {title} 邀请链接", callback_data=f"join_{gid}_{user.id}"
         )]]
-        await update.message.reply_text(
+        await send_user_menu(update, context,
             f"欢迎！点击按钮获取「{title}」的一次性邀请链接。",
             reply_markup=InlineKeyboardMarkup(keyboard)
         )
@@ -765,7 +798,7 @@ async def handle_join_direct(update: Update, context: ContextTypes.DEFAULT_TYPE,
             "👉 一键获取所有群组邀请链接",
             callback_data=f"joinall_{user.id}_{admin_id}"
         )])
-    await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+    await send_user_menu(update, context, text, InlineKeyboardMarkup(keyboard))
 
 async def handle_join_flow(update: Update, context: ContextTypes.DEFAULT_TYPE, user, admin_id):
     """处理用户加入流程，点击获取按钮后才生成邀请。"""
@@ -783,7 +816,7 @@ async def handle_join_flow(update: Update, context: ContextTypes.DEFAULT_TYPE, u
         keyboard = [[InlineKeyboardButton(
             f"👉 获取 {title} 邀请链接", callback_data=f"join_{group_id}_{user.id}"
         )]]
-        await update.message.reply_text(
+        await send_user_menu(update, context,
             f"欢迎！点击按钮获取「{title}」的一次性邀请链接。",
             reply_markup=InlineKeyboardMarkup(keyboard)
         )
@@ -814,7 +847,7 @@ async def handle_join_flow(update: Update, context: ContextTypes.DEFAULT_TYPE, u
         "👉 一键获取所有群组邀请链接",
         callback_data=f"joinall_{user.id}_{admin_id}"
     )])
-    await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+    await send_user_menu(update, context, text, InlineKeyboardMarkup(keyboard))
 
 async def handle_join_all(update: Update, context: ContextTypes.DEFAULT_TYPE, user, admin_id):
     """处理批量加入流程，点击获取后才生成邀请。"""
@@ -831,7 +864,7 @@ async def handle_join_all(update: Update, context: ContextTypes.DEFAULT_TYPE, us
         keyboard = [[InlineKeyboardButton(
             f"👉 获取 {title} 邀请链接", callback_data=f"join_{group_id}_{user.id}"
         )]]
-        await update.message.reply_text(
+        await send_user_menu(update, context,
             f"欢迎！点击按钮获取「{title}」的一次性邀请链接。",
             reply_markup=InlineKeyboardMarkup(keyboard)
         )
@@ -853,14 +886,14 @@ async def handle_join_all(update: Update, context: ContextTypes.DEFAULT_TYPE, us
         text = "⏳ 所有群组都在冷却中：\n\n"
         for title, ttl in cooling_groups:
             text += f"• {title}: {format_time_left(ttl)}\n"
-        await update.message.reply_text(text)
+        await send_user_menu(update, context, text, None)
         return
 
     keyboard = [[InlineKeyboardButton(
         "👉 获取所有可用群组的邀请链接",
         callback_data=f"joinall_{user.id}_{admin_id}"
     )]]
-    await update.message.reply_text(
+    await send_user_menu(update, context,
         "👉 点击按钮后才会生成一次性邀请链接。",
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
@@ -948,6 +981,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     text = update.message.text or ""
     logger.info(f"Start command from user: {user.id}, text: {text}")
+    await clear_user_menu(context.bot, user.id)
     
     # 解析 start 参数：/start join_{admin_id} 或 /start joinall_{admin_id}
     start_param = ""
