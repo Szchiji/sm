@@ -758,6 +758,13 @@ async def handle_join_direct(update: Update, context: ContextTypes.DEFAULT_TYPE,
 
     text = WELCOME_TEXT + "\n\n👉 点击按钮后才会生成一次性邀请链接"
     text += f"\n\n🕐 每群组按各自设置的冷却时间限领一次 | ✅ = 已领取"
+    direct_admin_ids = {admin_id for _, admin_id, _ in all_groups.values()}
+    if len(direct_admin_ids) == 1:
+        admin_id = next(iter(direct_admin_ids))
+        keyboard.insert(0, [InlineKeyboardButton(
+            "👉 一键获取所有群组邀请链接",
+            callback_data=f"joinall_{user.id}_{admin_id}"
+        )])
     await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def handle_join_flow(update: Update, context: ContextTypes.DEFAULT_TYPE, user, admin_id):
