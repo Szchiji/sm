@@ -29,6 +29,7 @@ PENDING_REQUEST_PREFIX = "tg_bot:pending:"
 ADMIN_STATE_PREFIX = "tg_bot:admin_state:"
 ADMIN_STATE_TTL = 300
 ACTIVE_INVITES_KEY = "tg_bot:active_invites"
+BACKUP_INTERVAL_SECONDS = 86400
 
 
 def groups_key(admin_id):

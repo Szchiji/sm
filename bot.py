@@ -15,6 +15,7 @@ from telegram.ext import (
 
 from bot_config import *  # noqa: F403 - 运行配置集中在 bot_config.py
 from bot_utils import JsonFormatter, now_utc, parse_timestamp
+from drive_backup import BACKUP_INTERVAL_SECONDS, BACKUP_LAST_KEY, upload_snapshot
 
 # 日志配置：统一输出 JSON，便于 Railway 日志检索和告警。
 logging.basicConfig(level=logging.INFO, handlers=[logging.StreamHandler()])
@@ -555,6 +556,23 @@ async def cleanup_expired_data(application: Application):
             
             # 3. 检查即将过期的冷却
             await cleanup_expired_cooldowns()
+
+            # 4. 每日将 Redis 关键数据备份到 Google Drive（未配置时安全跳过）
+            if redis_client:
+                last_backup = redis_client.get(BACKUP_LAST_KEY)
+                should_backup = True
+                if last_backup:
+                    try:
+                        should_backup = now_utc() - parse_timestamp(last_backup) >= timedelta(seconds=BACKUP_INTERVAL_SECONDS)
+                    except (TypeError, ValueError):
+                        should_backup = True
+                if should_backup:
+                    result = await asyncio.to_thread(upload_snapshot, redis_client)
+                    if result.get("status") == "uploaded":
+                        redis_client.set(BACKUP_LAST_KEY, now_utc().isoformat())
+                        logger.info(f"Drive backup uploaded: {result.get('file', {}).get('name')}; trashed={result.get('trashed', 0)}")
+                    elif result.get("status") == "disabled":
+                        logger.info("Drive backup skipped: credentials or folder ID not configured")
             
             # 获取统计
             if redis_client:

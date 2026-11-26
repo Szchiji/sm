@@ -5,7 +5,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY bot.py bot_config.py bot_utils.py ./
+COPY bot.py bot_config.py bot_utils.py drive_backup.py ./
 
 # 机器人不需要 root 权限运行。
 RUN useradd --create-home --uid 10001 botuser \
