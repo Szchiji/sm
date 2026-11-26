@@ -18,6 +18,8 @@ from bot_utils import JsonFormatter, now_utc, parse_timestamp
 from drive_backup import BACKUP_LAST_KEY, upload_snapshot
 
 # 日志配置：统一输出 JSON，便于 Railway 日志检索和告警。
+for _logger_name in ("httpx", "httpcore", "telegram.request"):
+    logging.getLogger(_logger_name).setLevel(logging.WARNING)
 logging.basicConfig(level=logging.INFO, handlers=[logging.StreamHandler()])
 for _handler in logging.getLogger().handlers:
     _handler.setFormatter(JsonFormatter())
@@ -34,6 +36,7 @@ redis_client = None
 
 
 USER_MENU_KEY_PREFIX = "tg_bot:user_menu:"
+ADMIN_MENU_KEY_PREFIX = "tg_bot:admin_menu:"
 
 
 async def clear_user_menu(bot, user_id):
@@ -61,6 +64,32 @@ async def send_user_menu(update, context, text, reply_markup):
     message = await update.message.reply_text(text, reply_markup=reply_markup)
     if redis_client:
         redis_client.set(key,
+            json.dumps({"chat_id": message.chat_id, "message_id": message.message_id}),
+        )
+    return message
+
+
+async def send_admin_menu(update, context, text, reply_markup):
+    """优先编辑管理员已有主菜单，避免重复发送管理员面板。"""
+    key = f"{ADMIN_MENU_KEY_PREFIX}{update.effective_user.id}"
+    if redis_client:
+        raw = redis_client.get(key)
+        if raw:
+            try:
+                menu = json.loads(raw)
+                await context.bot.edit_message_text(
+                    chat_id=menu["chat_id"],
+                    message_id=menu["message_id"],
+                    text=text,
+                    reply_markup=reply_markup,
+                )
+                return None
+            except Exception as exc:
+                logger.info("Existing admin menu could not be edited: %s", exc)
+    message = await update.message.reply_text(text, reply_markup=reply_markup)
+    if redis_client:
+        redis_client.set(
+            key,
             json.dumps({"chat_id": message.chat_id, "message_id": message.message_id}),
         )
     return message
@@ -1009,7 +1038,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # 管理员面板
     if not start_param:
         clear_admin_state(user.id)
-        await update.message.reply_text(
+        await send_admin_menu(
+            update,
+            context,
             build_admin_main_text(user.id),
             reply_markup=build_admin_main_keyboard(user.id)
         )
@@ -1718,8 +1749,32 @@ async def admin_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
         except ValueError:
             await update.message.reply_text("❌ 无效的群组 ID，请发送数字（如 -1001234567890）")
             return
-        set_admin_state(user.id, {"action": "bind_group_name", "group_id": str(group_id)})
-        await update.message.reply_text(f"✅ 群组 ID: {group_id}\n\n请继续发送群组名称：")
+        try:
+            allowed, reason = await verify_group_invite_permission(context.bot, group_id)
+        except Exception as exc:
+            logger.warning("Failed to verify group %s from button flow: %s", group_id, exc)
+            await update.message.reply_text(
+                "❌ 无法访问该群组。请确认群组 ID 正确，并已将机器人加入群组。"
+            )
+            return
+        if not allowed:
+            await update.message.reply_text(f"❌ 无法绑定：{reason}")
+            return
+        try:
+            chat = await context.bot.get_chat(group_id)
+            group_title = chat.title or str(group_id)
+        except Exception:
+            group_title = str(group_id)
+        clear_admin_state(user.id)
+        if save_group(group_id, group_title, user.id):
+            await send_admin_menu(
+                update,
+                context,
+                build_admin_main_text(user.id),
+                build_admin_main_keyboard(user.id),
+            )
+        else:
+            await update.message.reply_text("❌ 绑定失败")
         return
 
     if action == "bind_group_name":
