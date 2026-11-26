@@ -349,28 +349,38 @@ def clear_admin_state(user_id):
     redis_client.delete(f"{ADMIN_STATE_PREFIX}{user_id}")
 
 def migrate_global_groups():
-    """将旧全局群组数据迁移到按管理员隔离的 key"""
+    """将旧全局群组数据迁移到按管理员隔离的 key，并恢复无归属群组。"""
     if not redis_client:
         return
     try:
-        data = redis_client.get(GROUPS_KEY)
+        source_key = GROUPS_KEY
+        data = redis_client.get(source_key)
+        if not data:
+            # 旧版本迁移曾把缺少 added_by 的群组留在此备份 key，不能永久丢失。
+            source_key = f"{GROUPS_KEY}:migrated"
+            data = redis_client.get(source_key)
         if not data:
             return
         global_groups = json.loads(data)
         if not global_groups:
             return
+        fallback_admins = get_admin_ids_from_env()
+        fallback_admin = fallback_admins[0] if fallback_admins else None
         logger.info(f"Migrating {len(global_groups)} groups from global key to per-admin keys...")
         for gid, info in global_groups.items():
-            admin_id = info.get("added_by")
+            admin_id = info.get("added_by") or fallback_admin
             if not admin_id:
-                logger.warning(f"Group {gid} has no added_by, skipping migration")
+                logger.warning(f"Group {gid} has no added_by and no fallback admin, skipping migration")
                 continue
             save_group(gid, info["title"], admin_id)
-        # 重命名旧 key 以防止重复迁移
-        try:
-            redis_client.rename(GROUPS_KEY, f"{GROUPS_KEY}:migrated")
-        except Exception as rename_err:
-            logger.warning(f"Could not rename old groups key: {rename_err}")
+        # 只在处理原始 key 时改名；恢复 migrated 备份后保留原备份，避免数据不可逆丢失。
+        if source_key == GROUPS_KEY:
+            try:
+                redis_client.rename(GROUPS_KEY, f"{GROUPS_KEY}:migrated")
+            except Exception as rename_err:
+                logger.warning(f"Could not rename old groups key: {rename_err}")
+        else:
+            logger.info("Recovered groups from the previous migration backup key")
         logger.info("Migration complete")
     except Exception as e:
         logger.error(f"Migration failed: {e}")
