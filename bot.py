@@ -37,29 +37,30 @@ USER_MENU_KEY_PREFIX = "tg_bot:user_menu:"
 
 
 async def clear_user_menu(bot, user_id):
-    """删除机器人为用户保存的上一条主菜单消息。"""
-    if not redis_client:
-        return
-    key = f"{USER_MENU_KEY_PREFIX}{user_id}"
-    raw = redis_client.get(key)
-    redis_client.delete(key)
-    if not raw:
-        return
-    try:
-        menu = json.loads(raw)
-        await bot.delete_message(
-            chat_id=menu["chat_id"], message_id=menu["message_id"]
-        )
-    except Exception as exc:
-        logger.info("Previous user menu could not be deleted: %s", exc)
+    """保留上一条菜单记录，下一步优先直接编辑它。"""
+    return redis_client.get(f"{USER_MENU_KEY_PREFIX}{user_id}") if redis_client else None
 
 
 async def send_user_menu(update, context, text, reply_markup):
-    """发送并记录用户唯一主菜单，后续 /start 可删除它。"""
+    """优先编辑已有主菜单，只有不存在或失效时才发送新消息。"""
+    key = f"{USER_MENU_KEY_PREFIX}{update.effective_user.id}"
+    if redis_client:
+        raw = redis_client.get(key)
+        if raw:
+            try:
+                menu = json.loads(raw)
+                await context.bot.edit_message_text(
+                    chat_id=menu["chat_id"],
+                    message_id=menu["message_id"],
+                    text=text,
+                    reply_markup=reply_markup,
+                )
+                return None
+            except Exception as exc:
+                logger.info("Existing user menu could not be edited: %s", exc)
     message = await update.message.reply_text(text, reply_markup=reply_markup)
     if redis_client:
-        redis_client.set(
-            f"{USER_MENU_KEY_PREFIX}{update.effective_user.id}",
+        redis_client.set(key,
             json.dumps({"chat_id": message.chat_id, "message_id": message.message_id}),
         )
     return message
