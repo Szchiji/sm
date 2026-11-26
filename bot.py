@@ -1,4 +1,3 @@
-import os
 import csv
 import io
 import logging
@@ -6,7 +5,7 @@ import redis
 import json
 import asyncio
 import re
-from datetime import datetime, timedelta, timezone
+from datetime import timedelta
 from aiohttp import web
 from telegram import Update, InputFile, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -14,73 +13,14 @@ from telegram.ext import (
     ChatMemberHandler, ContextTypes, MessageHandler, filters
 )
 
+from bot_config import *  # noqa: F403 - 运行配置集中在 bot_config.py
+from bot_utils import JsonFormatter, now_utc, parse_timestamp
+
 # 日志配置：统一输出 JSON，便于 Railway 日志检索和告警。
-class JsonFormatter(logging.Formatter):
-    def format(self, record):
-        payload = {
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "level": record.levelname,
-            "logger": record.name,
-            "message": record.getMessage(),
-        }
-        if record.exc_info:
-            payload["exception"] = self.formatException(record.exc_info)
-        return json.dumps(payload, ensure_ascii=False)
-
-
 logging.basicConfig(level=logging.INFO, handlers=[logging.StreamHandler()])
 for _handler in logging.getLogger().handlers:
     _handler.setFormatter(JsonFormatter())
 logger = logging.getLogger(__name__)
-
-
-def now_utc():
-    """返回带时区信息的 UTC 时间。"""
-    return datetime.now(timezone.utc)
-
-
-def parse_timestamp(value):
-    """解析时间，并将旧版本无时区时间按 UTC 兼容处理。"""
-    parsed = datetime.fromisoformat(value)
-    return parsed.replace(tzinfo=timezone.utc) if parsed.tzinfo is None else parsed
-
-# 环境变量
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_USER_IDS = os.getenv("ADMIN_USER_IDS", "")
-WELCOME_TEXT = os.getenv("WELCOME_TEXT", "👋 欢迎！请选择要加入的群组：")
-REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
-PORT = int(os.environ.get("PORT", 8080))
-INVITE_EXPIRE_MINUTES = int(os.getenv("INVITE_EXPIRE_MINUTES", "1440"))
-# 默认冷却时间使用分钟；兼容旧的 INVITE_COOLDOWN_HOURS 环境变量
-_legacy_cooldown_hours = int(os.getenv("INVITE_COOLDOWN_HOURS", "24"))
-DEFAULT_COOLDOWN_MINUTES = int(os.getenv("INVITE_COOLDOWN_MINUTES", str(_legacy_cooldown_hours * 60)))
-MIN_COOLDOWN_MINUTES = 1
-MAX_COOLDOWN_MINUTES = 43200  # 30 天
-
-# Railway 域名检测
-RAILWAY_DOMAIN = (
-    os.environ.get("RAILWAY_PUBLIC_DOMAIN") or 
-    os.environ.get("RAILWAY_URL") or 
-    os.environ.get("RAILWAY_STATIC_URL")
-)
-
-WEBHOOK_URL = os.environ.get("WEBHOOK_URL")
-
-# Redis Key 前缀
-GROUPS_KEY = "tg_bot:groups"           # 旧全局 key（仅用于迁移）
-GROUPS_PREFIX = "tg_bot:groups:"       # 新按管理员隔离的 key，后跟 admin_id
-GROUP_OWNER_PREFIX = "tg_bot:group_owner:"  # 反向查找：group_id -> admin_id
-ADMINS_KEY = "tg_bot:admins"
-INVITE_LOG_KEY = "tg_bot:invite_log"
-USER_INVITE_PREFIX = "tg_bot:user_invite:"
-PENDING_REQUEST_PREFIX = "tg_bot:pending:"  # 待审批申请：key = pending:{user_id}_{group_id}
-ADMIN_STATE_PREFIX = "tg_bot:admin_state:"  # 管理员输入状态：key = admin_state:{user_id}
-ADMIN_STATE_TTL = 300  # 状态 5 分钟过期
-ACTIVE_INVITES_KEY = "tg_bot:active_invites"  # Hash: invite_link_url -> JSON 元数据
-
-def groups_key(admin_id):
-    """返回指定管理员的群组 Redis key"""
-    return f"{GROUPS_PREFIX}{admin_id}"
 
 # 连接 Redis
 try:
