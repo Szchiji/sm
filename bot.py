@@ -1375,21 +1375,39 @@ async def admin_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
         )
         return
 
-    # ── 群组列表 ───────────────────────────────────────────────────────────────
-    if data == "adm_groups":
+    # ── 群组列表（分页，避免按钮和消息过长） ────────────────────────────────────
+    if data == "adm_groups" or data.startswith("adm_groups_page_"):
         await query.answer()
         groups = get_groups(user.id)
+        page_size = 8
+        try:
+            page = max(0, int(data.rsplit("_", 1)[-1])) if data != "adm_groups" else 0
+        except ValueError:
+            page = 0
+        group_items = list(groups.items())
+        total_pages = max(1, (len(group_items) + page_size - 1) // page_size)
+        page = min(page, total_pages - 1)
+        start = page * page_size
         keyboard = []
-        if groups:
-            for gid, info in groups.items():
-                icon = "🔒" if info.get('approval_required', False) else "🔓"
-                keyboard.append([InlineKeyboardButton(
-                    f"{icon} {info['title']}",
-                    callback_data=f"adm_grp_info_{gid}"
-                )])
+        for gid, info in group_items[start:start + page_size]:
+            icon = "🔒" if info.get('approval_required', False) else "🔓"
+            title = str(info.get("title", gid))
+            button_title = title if len(title) <= 40 else title[:37] + "..."
+            keyboard.append([InlineKeyboardButton(
+                f"{icon} {button_title}",
+                callback_data=f"adm_grp_info_{gid}"
+            )])
+        if total_pages > 1:
+            nav = []
+            if page > 0:
+                nav.append(InlineKeyboardButton("⬅️ 上一页", callback_data=f"adm_groups_page_{page - 1}"))
+            nav.append(InlineKeyboardButton(f"{page + 1}/{total_pages}", callback_data="adm_groups"))
+            if page < total_pages - 1:
+                nav.append(InlineKeyboardButton("下一页 ➡️", callback_data=f"adm_groups_page_{page + 1}"))
+            keyboard.append(nav)
         keyboard.append([InlineKeyboardButton("➕ 手动绑定群组", callback_data="adm_bindgroup")])
         keyboard.append([InlineKeyboardButton("⬅️ 返回", callback_data="adm_back")])
-        msg = (f"📋 已绑定群组（{len(groups)} 个）\n🔓=直接加入  🔒=需审批"
+        msg = (f"📋 已绑定群组（{len(groups)} 个）\n第 {page + 1}/{total_pages} 页\n🔓=直接加入  🔒=需审批"
                if groups else "暂无绑定的群组\n\n将机器人设为群管理员后即可自动绑定")
         await query.edit_message_text(msg, reply_markup=InlineKeyboardMarkup(keyboard))
         return
