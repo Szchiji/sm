@@ -166,6 +166,27 @@ def get_group_cooldown_minutes(group_id, admin_id=None):
     return DEFAULT_COOLDOWN_MINUTES
 
 
+def refresh_group_cooldown_keys(group_id, cooldown_minutes):
+    """按新配置刷新该群组已有用户冷却，0 表示立即清除。"""
+    if not redis_client:
+        return
+    suffix = f":{group_id}"
+    for key in redis_client.scan_iter(match=f"{USER_INVITE_PREFIX}*{suffix}"):
+        if cooldown_minutes == 0:
+            redis_client.delete(key)
+            continue
+        created_at = redis_client.get(key)
+        try:
+            elapsed = int((now_utc() - parse_timestamp(created_at)).total_seconds())
+        except (TypeError, ValueError):
+            elapsed = 0
+        remaining = cooldown_minutes * 60 - elapsed
+        if remaining <= 0:
+            redis_client.delete(key)
+        else:
+            redis_client.expire(key, remaining)
+
+
 def set_group_cooldown(group_id, admin_id, cooldown_minutes):
     """设置管理员所属群组的冷却时间，范围为 1 至 43200 分钟，并启用冷却。"""
     if not redis_client or not MIN_COOLDOWN_MINUTES <= cooldown_minutes <= MAX_COOLDOWN_MINUTES:
@@ -178,6 +199,7 @@ def set_group_cooldown(group_id, admin_id, cooldown_minutes):
         groups[gid]["cooldown_minutes"] = cooldown_minutes
         groups[gid]["cooldown_enabled"] = True
         redis_client.set(groups_key(admin_id), json.dumps(groups))
+        refresh_group_cooldown_keys(gid, cooldown_minutes)
         return True
     except Exception as e:
         logger.error(f"Failed to set cooldown for group {group_id}: {e}")
@@ -202,6 +224,7 @@ def set_group_cooldown_enabled(group_id, admin_id, enabled):
             except (TypeError, ValueError):
                 groups[gid]["cooldown_minutes"] = DEFAULT_COOLDOWN_MINUTES
         redis_client.set(groups_key(admin_id), json.dumps(groups))
+        refresh_group_cooldown_keys(gid, get_group_cooldown_minutes(gid, admin_id) if enabled else 0)
         return True
     except Exception as e:
         logger.error(f"Failed to toggle cooldown for group {group_id}: {e}")
