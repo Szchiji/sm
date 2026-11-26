@@ -926,6 +926,53 @@ def build_admin_main_text(user_id):
         f"邀请冷却: 按群组设置（默认 {format_cooldown(DEFAULT_COOLDOWN_MINUTES)}）"
     )
 
+
+def build_group_detail_view(admin_id, group_id):
+    """构建群组详情文本和按钮，供群组设置操作后统一刷新。"""
+    groups = get_groups(admin_id)
+    info = groups[str(group_id)]
+    approval = "🔒 需审批" if info.get("approval_required", False) else "🔓 直接加入"
+    cooldown = get_group_cooldown_minutes(group_id, admin_id)
+    toggle_label = "🔓 切换为直接加入" if info.get("approval_required", False) else "🔒 切换为需审批"
+    keyboard = [
+        [InlineKeyboardButton(toggle_label, callback_data=f"adm_grp_tog_{group_id}")],
+        [InlineKeyboardButton("⏱️ 设置邀请冷却", callback_data=f"adm_grp_cd_{group_id}")],
+        [InlineKeyboardButton("❌ 移除群组", callback_data=f"adm_grp_del_{group_id}")],
+        [InlineKeyboardButton("⬅️ 返回群组列表", callback_data="adm_groups")],
+    ]
+    text = (
+        f"群组：{info['title']}\n"
+        f"ID: `{group_id}`\n"
+        f"审批模式: {approval}\n"
+        f"邀请冷却: {format_cooldown(cooldown)}"
+    )
+    return text, InlineKeyboardMarkup(keyboard)
+
+
+def build_cooldown_keyboard(group_id, cooldown_minutes):
+    """构建群组冷却的预设、开关和自定义按钮。"""
+    enabled = cooldown_minutes > 0
+    keyboard = [
+        [InlineKeyboardButton("✅ 已开启" if enabled else "⛔ 已关闭", callback_data="adm_noop")],
+        [
+            InlineKeyboardButton("关闭冷却", callback_data=f"adm_grp_cd_off_{group_id}"),
+            InlineKeyboardButton("开启冷却", callback_data=f"adm_grp_cd_on_{group_id}"),
+        ],
+        [
+            InlineKeyboardButton("5 分钟", callback_data=f"adm_grp_cd_set_{group_id}_5"),
+            InlineKeyboardButton("30 分钟", callback_data=f"adm_grp_cd_set_{group_id}_30"),
+            InlineKeyboardButton("1 小时", callback_data=f"adm_grp_cd_set_{group_id}_60"),
+        ],
+        [
+            InlineKeyboardButton("6 小时", callback_data=f"adm_grp_cd_set_{group_id}_360"),
+            InlineKeyboardButton("24 小时", callback_data=f"adm_grp_cd_set_{group_id}_1440"),
+            InlineKeyboardButton("7 天", callback_data=f"adm_grp_cd_set_{group_id}_10080"),
+        ],
+        [InlineKeyboardButton("✏️ 自定义分钟数", callback_data=f"adm_grp_cd_custom_{group_id}")],
+        [InlineKeyboardButton("⬅️ 返回群组详情", callback_data=f"adm_grp_info_{group_id}")],
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     text = update.message.text or ""
@@ -1383,19 +1430,66 @@ async def admin_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
                 reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ 返回", callback_data="adm_groups")]])
             )
             return
-        info = groups[gid]
-        approval = "🔒 需审批" if info.get('approval_required', False) else "🔓 直接加入"
-        cooldown_minutes = get_group_cooldown_minutes(gid, user.id)
-        toggle_label = "🔓 切换为直接加入" if info.get('approval_required', False) else "🔒 切换为需审批"
-        keyboard = [
-            [InlineKeyboardButton(toggle_label, callback_data=f"adm_grp_tog_{gid}")],
-            [InlineKeyboardButton("❌ 移除群组", callback_data=f"adm_grp_del_{gid}")],
-            [InlineKeyboardButton("⬅️ 返回群组列表", callback_data="adm_groups")],
-        ]
+        text, markup = build_group_detail_view(user.id, gid)
+        await query.edit_message_text(text, reply_markup=markup, parse_mode="Markdown")
+        return
+
+    # ── 群组冷却设置 ───────────────────────────────────────────────────────────
+    if data == "adm_noop":
+        await query.answer()
+        return
+
+    if data.startswith("adm_grp_cd_"):
+        await query.answer()
+        remainder = data[len("adm_grp_cd_"):]
+        if remainder.startswith("off_"):
+            gid = remainder[len("off_"):]
+            if not set_group_cooldown_enabled(gid, user.id, False):
+                await query.answer("设置失败", show_alert=True)
+                return
+            await query.answer("邀请冷却已关闭")
+            minutes = 0
+        elif remainder.startswith("on_"):
+            gid = remainder[len("on_"):]
+            if not set_group_cooldown_enabled(gid, user.id, True):
+                await query.answer("设置失败", show_alert=True)
+                return
+            await query.answer("邀请冷却已开启")
+            minutes = get_group_cooldown_minutes(gid, user.id)
+        elif remainder.startswith("set_"):
+            value, _, minutes_text = remainder[len("set_"):].rpartition("_")
+            try:
+                minutes = int(minutes_text)
+            except ValueError:
+                await query.answer("冷却时间无效", show_alert=True)
+                return
+            gid = value
+            if not set_group_cooldown(gid, user.id, minutes):
+                await query.answer("设置失败", show_alert=True)
+                return
+            await query.answer(f"已设置为 {format_cooldown(minutes)}")
+        elif remainder.startswith("custom_"):
+            gid = remainder[len("custom_"):]
+            if gid not in get_groups(user.id):
+                await query.answer("群组不存在", show_alert=True)
+                return
+            set_admin_state(user.id, {"action": "cooldown_custom", "group_id": gid})
+            await query.edit_message_text(
+                f"✏️ 请发送群组 `{gid}` 的冷却分钟数\n范围：{MIN_COOLDOWN_MINUTES}～{MAX_COOLDOWN_MINUTES} 分钟",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("取消", callback_data=f"adm_grp_info_{gid}")]]),
+                parse_mode="Markdown",
+            )
+            return
+        else:
+            gid = remainder
+            if gid not in get_groups(user.id):
+                await query.answer("群组不存在", show_alert=True)
+                return
+            minutes = get_group_cooldown_minutes(gid, user.id)
+
         await query.edit_message_text(
-            f"群组：{info['title']}\nID: `{gid}`\n审批模式: {approval}\n冷却时间: {format_cooldown(cooldown_minutes)}\n\n可用命令：/setcooldown {gid} [分钟数|on|off]",
-            reply_markup=InlineKeyboardMarkup(keyboard),
-            parse_mode="Markdown"
+            f"⏱️ 邀请冷却设置\n\n当前状态：{'已开启' if minutes else '已关闭'}\n当前时长：{format_cooldown(minutes)}",
+            reply_markup=build_cooldown_keyboard(gid, minutes),
         )
         return
 
@@ -1410,21 +1504,8 @@ async def admin_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
         set_group_approval(gid, user.id, not current)
         status = "开启 🔒" if not current else "关闭 🔓"
         await query.answer(f"审批模式已{status}")
-        # 刷新群组详情
-        groups = get_groups(user.id)
-        info = groups[gid]
-        approval = "🔒 需审批" if info.get('approval_required', False) else "🔓 直接加入"
-        toggle_label = "🔓 切换为直接加入" if info.get('approval_required', False) else "🔒 切换为需审批"
-        keyboard = [
-            [InlineKeyboardButton(toggle_label, callback_data=f"adm_grp_tog_{gid}")],
-            [InlineKeyboardButton("❌ 移除群组", callback_data=f"adm_grp_del_{gid}")],
-            [InlineKeyboardButton("⬅️ 返回群组列表", callback_data="adm_groups")],
-        ]
-        await query.edit_message_text(
-            f"群组：{info['title']}\nID: `{gid}`\n审批模式: {approval}",
-            reply_markup=InlineKeyboardMarkup(keyboard),
-            parse_mode="Markdown"
-        )
+        text, markup = build_group_detail_view(user.id, gid)
+        await query.edit_message_text(text, reply_markup=markup, parse_mode="Markdown")
         return
 
     # ── 确认移除群组 ───────────────────────────────────────────────────────────
@@ -1639,6 +1720,31 @@ async def admin_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
             )
         else:
             await update.message.reply_text("❌ 绑定失败", reply_markup=build_admin_main_keyboard(user.id))
+        return
+
+    if action == "cooldown_custom":
+        group_id = str(state.get("group_id", ""))
+        try:
+            cooldown_minutes = int(text)
+        except ValueError:
+            await update.message.reply_text(
+                f"❌ 请输入整数分钟数，范围为 {MIN_COOLDOWN_MINUTES}～{MAX_COOLDOWN_MINUTES}"
+            )
+            return
+        if not MIN_COOLDOWN_MINUTES <= cooldown_minutes <= MAX_COOLDOWN_MINUTES:
+            await update.message.reply_text(
+                f"❌ 分钟数必须在 {MIN_COOLDOWN_MINUTES}～{MAX_COOLDOWN_MINUTES} 之间"
+            )
+            return
+        if not set_group_cooldown(group_id, user.id, cooldown_minutes):
+            clear_admin_state(user.id)
+            await update.message.reply_text("❌ 冷却时间设置失败")
+            return
+        clear_admin_state(user.id)
+        await update.message.reply_text(
+            f"✅ 已将群组冷却设置为 {format_cooldown(cooldown_minutes)}",
+            reply_markup=build_admin_main_keyboard(user.id),
+        )
         return
 
 async def cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
