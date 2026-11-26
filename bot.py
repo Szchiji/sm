@@ -709,7 +709,7 @@ def build_group_selection_keyboard(user_id, admin_id, groups):
     return keyboard, text
 
 async def handle_join_direct(update: Update, context: ContextTypes.DEFAULT_TYPE, user):
-    """用户直接打开机器人（无邀请参数）时，汇总所有管理员群组并生成邀请链接"""
+    """用户直接打开机器人（无邀请参数）时，仅展示获取邀请按钮。"""
     all_admin_ids = get_all_admin_ids()
 
     # 收集所有群组，记录 group_id -> (title, admin_id, group_info)
@@ -724,16 +724,21 @@ async def handle_join_direct(update: Update, context: ContextTypes.DEFAULT_TYPE,
         await update.message.reply_text("机器人尚未配置群组，请联系管理员")
         return
 
-    # 只有一个群组，直接发送邀请
+    # 只有一个群组：先展示获取按钮，点击后才生成邀请
     if len(all_groups) == 1:
         gid = list(all_groups.keys())[0]
         title, admin_id, info = all_groups[gid]
-        await send_single_invite(update, context, user, gid, title, admin_id)
+        keyboard = [[InlineKeyboardButton(
+            f"👉 获取 {title} 邀请链接", callback_data=f"join_{gid}_{user.id}"
+        )]]
+        await update.message.reply_text(
+            f"欢迎！点击按钮获取「{title}」的一次性邀请链接。",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
         return
 
-    # 多个群组：直接生成邀请链接
+    # 多个群组：只展示获取按钮，不预先生成邀请
     keyboard = []
-    has_invite = False
     for gid, (title, admin_id, info) in all_groups.items():
         can_get, ttl = can_user_get_invite(user.id, gid, admin_id)
         if not can_get:
@@ -747,27 +752,16 @@ async def handle_join_direct(update: Update, context: ContextTypes.DEFAULT_TYPE,
                 callback_data=f"select_{gid}_{user.id}_{admin_id}"
             )])
         else:
-            try:
-                invite_link = await create_claimed_invite(context.bot, user.id, gid, admin_id)
-                log_invite(user.id, gid, invite_link.invite_link, title, admin_id)
-                record_user_invite(user.id, gid, admin_id)
-                keyboard.append([InlineKeyboardButton(f"👉 加入 {title}", url=invite_link.invite_link)])
-                has_invite = True
-            except Exception as e:
-                logger.error(f"Failed to create invite for {gid}: {e}")
-                keyboard.append([InlineKeyboardButton(
-                    f"❌ {title} (生成失败，点击重试)",
-                    callback_data=f"select_{gid}_{user.id}_{admin_id}"
-                )])
+            keyboard.append([InlineKeyboardButton(
+                f"👉 获取 {title} 邀请链接", callback_data=f"join_{gid}_{user.id}"
+            )])
 
-    text = WELCOME_TEXT
-    if has_invite:
-        text += "\n\n🔒 每个链接仅限使用一次"
+    text = WELCOME_TEXT + "\n\n👉 点击按钮后才会生成一次性邀请链接"
     text += f"\n\n🕐 每群组按各自设置的冷却时间限领一次 | ✅ = 已领取"
     await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def handle_join_flow(update: Update, context: ContextTypes.DEFAULT_TYPE, user, admin_id):
-    """处理用户加入流程（选择单个群组）"""
+    """处理用户加入流程，点击获取按钮后才生成邀请。"""
     groups = get_groups(admin_id)
     logger.info(f"Current groups for admin {admin_id}: {groups}")
     
@@ -775,15 +769,21 @@ async def handle_join_flow(update: Update, context: ContextTypes.DEFAULT_TYPE, u
         await update.message.reply_text("机器人尚未配置群组，请联系管理员")
         return
     
-    # 只有一个群组，直接处理
+    # 只有一个群组：先展示获取按钮，点击后才生成邀请
     if len(groups) == 1:
         group_id = list(groups.keys())[0]
-        await send_single_invite(update, context, user, group_id, list(groups.values())[0]['title'], admin_id)
+        title = list(groups.values())[0]['title']
+        keyboard = [[InlineKeyboardButton(
+            f"👉 获取 {title} 邀请链接", callback_data=f"join_{group_id}_{user.id}"
+        )]]
+        await update.message.reply_text(
+            f"欢迎！点击按钮获取「{title}」的一次性邀请链接。",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
         return
-    
-    # 多个群组：直接为可用群组生成邀请链接，已领取/审批群组保留回调按钮
+
+    # 多个群组：仅为可用群组展示获取按钮
     keyboard = []
-    has_invite = False
     for gid, info in groups.items():
         title = info['title']
         can_get, ttl = can_user_get_invite(user.id, gid, admin_id)
@@ -798,36 +798,32 @@ async def handle_join_flow(update: Update, context: ContextTypes.DEFAULT_TYPE, u
                 callback_data=f"select_{gid}_{user.id}_{admin_id}"
             )])
         else:
-            try:
-                invite_link = await create_claimed_invite(context.bot, user.id, gid, admin_id)
-                log_invite(user.id, gid, invite_link.invite_link, title, admin_id)
-                record_user_invite(user.id, gid, admin_id)
-                keyboard.append([InlineKeyboardButton(f"👉 加入 {title}", url=invite_link.invite_link)])
-                has_invite = True
-            except Exception as e:
-                logger.error(f"Failed to create invite for {gid}: {e}")
-                keyboard.append([InlineKeyboardButton(
-                    f"❌ {title} (生成失败，点击重试)",
-                    callback_data=f"select_{gid}_{user.id}_{admin_id}"
-                )])
-    text = WELCOME_TEXT
-    if has_invite:
-        text += "\n\n🔒 每个链接仅限使用一次"
+            keyboard.append([InlineKeyboardButton(
+                f"👉 获取 {title} 邀请链接", callback_data=f"join_{gid}_{user.id}"
+            )])
+    text = WELCOME_TEXT + "\n\n👉 点击按钮后才会生成一次性邀请链接"
     text += f"\n\n🕐 每群组按各自设置的冷却时间限领一次 | ✅ = 已领取"
     await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def handle_join_all(update: Update, context: ContextTypes.DEFAULT_TYPE, user, admin_id):
-    """处理批量加入所有群组"""
+    """处理批量加入流程，点击获取后才生成邀请。"""
     groups = get_groups(admin_id)
     
     if not groups:
         await update.message.reply_text("机器人尚未配置群组，请联系管理员")
         return
     
-    # 只有一个群组，直接处理
+    # 只有一个群组：先展示获取按钮，点击后才生成邀请
     if len(groups) == 1:
         group_id = list(groups.keys())[0]
-        await send_single_invite(update, context, user, group_id, list(groups.values())[0]['title'], admin_id)
+        title = list(groups.values())[0]['title']
+        keyboard = [[InlineKeyboardButton(
+            f"👉 获取 {title} 邀请链接", callback_data=f"join_{group_id}_{user.id}"
+        )]]
+        await update.message.reply_text(
+            f"欢迎！点击按钮获取「{title}」的一次性邀请链接。",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
         return
     
     # 检查每个群组的冷却状态
@@ -841,82 +837,23 @@ async def handle_join_all(update: Update, context: ContextTypes.DEFAULT_TYPE, us
         else:
             cooling_groups.append((info['title'], ttl))
     
+    # 先展示获取按钮，不在 /start 时生成邀请；点击后由 join_all_callback 处理。
     if not available_groups:
-        # 所有群组都在冷却中
         text = "⏳ 所有群组都在冷却中：\n\n"
         for title, ttl in cooling_groups:
             text += f"• {title}: {format_time_left(ttl)}\n"
         await update.message.reply_text(text)
         return
-    
-    if len(available_groups) == 1:
-        # 只有一个可用，直接发送
-        gid, title = available_groups[0]
-        await send_single_invite(update, context, user, gid, title, admin_id)
-        return
-    
-    # 多个可用，直接生成所有邀请链接，无需确认
-    processing_msg = await update.message.reply_text("⏳ 正在处理，请稍候...")
-    
-    keyboard_buttons = []
-    failed_groups = []
-    approval_submitted = []
-    success_count = 0
-    
-    for gid, title in available_groups:
-        group_info = groups[gid]
-        if group_info.get('approval_required', False):
-            # 该群组需要审批
-            existing = get_pending_request(user.id, gid)
-            if existing:
-                approval_submitted.append(f"⏳ {title} (审核中)")
-            else:
-                user_info = {"username": user.username, "first_name": user.first_name or ""}
-                save_pending_request(user.id, gid, user_info, title, admin_id)
-                user_detail = format_user_info(user.id, user.first_name or "", user.last_name or "", user.username)
-                notify_keyboard = [[
-                    InlineKeyboardButton("✅ 同意", callback_data=f"approve_{user.id}_{gid}"),
-                    InlineKeyboardButton("❌ 拒绝", callback_data=f"reject_{user.id}_{gid}")
-                ]]
-                try:
-                    await context.bot.send_message(
-                        chat_id=admin_id,
-                        text=f"📋 加群申请\n\n{user_detail}\n\n申请加入：{title}",
-                        reply_markup=InlineKeyboardMarkup(notify_keyboard),
-                        parse_mode="HTML"
-                    )
-                    approval_submitted.append(f"📤 {title} (等待审核)")
-                except Exception as e:
-                    logger.error(f"Failed to notify admin for {gid}: {e}")
-                    delete_pending_request(user.id, gid)
-                    failed_groups.append(title)
-        else:
-            try:
-                invite_link = await create_claimed_invite(context.bot, user.id, gid, admin_id)
-                log_invite(user.id, gid, invite_link.invite_link, title, admin_id)
-                record_user_invite(user.id, gid, admin_id)
-                keyboard_buttons.append([InlineKeyboardButton(f"👉 加入 {title}", url=invite_link.invite_link)])
-                success_count += 1
-            except Exception as e:
-                logger.error(f"Failed to create invite for {gid}: {e}")
-                failed_groups.append(title)
-    
-    text = ""
-    if success_count:
-        text += f"✅ 已生成 {success_count} 个邀请链接\n"
-    if approval_submitted:
-        text += "\n".join(approval_submitted) + "\n"
-    if cooling_groups:
-        text += f"⏳ {len(cooling_groups)} 个群组冷却中\n"
-    if failed_groups:
-        text += f"❌ {len(failed_groups)} 个群组处理失败\n"
-    if success_count:
-        text += "\n🔒 每个链接仅限使用一次"
-    
-    await processing_msg.edit_text(
-        text or "处理完成",
-        reply_markup=InlineKeyboardMarkup(keyboard_buttons) if keyboard_buttons else None
+
+    keyboard = [[InlineKeyboardButton(
+        "👉 获取所有可用群组的邀请链接",
+        callback_data=f"joinall_{user.id}_{admin_id}"
+    )]]
+    await update.message.reply_text(
+        "👉 点击按钮后才会生成一次性邀请链接。",
+        reply_markup=InlineKeyboardMarkup(keyboard)
     )
+    return
 
 # ============ 管理员面板（按钮菜单）============
 
